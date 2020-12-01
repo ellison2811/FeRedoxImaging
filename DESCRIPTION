@@ -1,0 +1,43 @@
+Type: Compendium
+Package: FeRedoxImaging
+Title: Data Processing for Quantitative Fe Redox
+    Imaging
+Version: 0.0.1
+Authors@R:
+    person(given = "Eric",
+           family = "Ellison",
+           role = c("aut", "cre"),
+           email = "eric.ellison@colorado.edu")
+Description: Data processing for quantitative Fe redox
+    imaging
+License: GNU GPLv3
+Depends:
+    akima,
+    bmp,
+    cowplot,
+    devtools,
+    dplyr,
+    fields,
+    furrr,
+    future,
+    ggpubr,
+    glue,
+    KernSmooth,
+    knitr,
+    ks,
+    lubridate,
+    magrittr,
+    packrat,
+    purrr,
+    raster,
+    readxl,
+    rhdf5,
+    rmarkdown,
+    rprojroot,
+    stats,
+    tidyr,
+    tidyselect,
+    tidyverse,
+    utils
+Encoding: UTF-8
+LazyData: true

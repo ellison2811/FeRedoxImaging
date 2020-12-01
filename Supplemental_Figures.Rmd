@@ -1,0 +1,91 @@
+---
+title: "Supplementary Information"
+author: Eric T. Ellison, Lisa E. Mayhew, Hannah M. Miller, and Alexis S. Templeton
+output:
+  pdf_document: 
+    latex_engine: xelatex
+    includes:
+      in_header: preamble-latex.tex
+header-includes:
+  - \usepackage{hyperref}
+  - \usepackage{fontspec}
+  - \setmainfont{Times New Roman}
+  - \usepackage{hypcap}
+bibliography: PEME_supplement.bib
+csl: american-mineralogist.csl
+link-citations: true
+urlcolor: blue
+citecolor: blue
+linkcolor: blue
+fontsize: 12pt
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, message = FALSE, warning = FALSE, echo = FALSE}
+library(fields)
+library(akima)
+library(furrr)
+library(tidyverse)
+library(readxl)
+library(rprojroot)
+
+root_path <- function(...){find_root_file(..., criterion = is_git_root)}
+
+knitr::opts_chunk$set(
+  dev = c("png", "cairo_pdf"), 
+  dev.args = list(pdf = list(encoding = "WinAnsi", useDingbats = FALSE)),
+  fig.keep = "all", 
+  fig.path = file.path("fig_output", "Ellison_etal_2019_"),
+  fig.align = "center",
+  message = FALSE, 
+  warning = FALSE,
+  echo = FALSE)
+
+theme_eric <- theme_classic() + 
+  theme(axis.text = element_text(color = "black", size = 12), 
+        panel.border = element_rect(color = "black", fill = NA, size = 1.1), 
+        axis.line = element_blank(),
+        axis.ticks.length = unit(1.75, "mm"),
+        axis.title = element_text(color = "black", size = 16),
+        axis.title.y = element_text(margin = margin(t = 0, r = 10, b = 0, l = 10)),
+        axis.title.x = element_text(margin = margin(t = 10, r = 0, b = 10, l = 0)))
+
+```
+
+# Data and Analysis Scripts
+The raw X-ray data and all of the R code used for the processing and analysis of the maps, error analyses, and generation of figures, are available in a Github repository associated with this work. The data and code can be installed in R in order to replicate the analyses performed here. The code is available at:
+
+https://github.com/ellison2811/FeRedoxImaging
+
+
+# Supplemental Figures
+```{r}
+load("Supplemental_Figures.rda")
+```
+
+
+```{r, fig.width = 6, fig.height = 7}
+SI_figure1
+```
+**Supplemental Figure 1**: Maps of pre-edge centroid position (A) and integrated intensity (B) prior to gaussian smoothing step. Abbreviations: Ol = olivine, Srp = Serpentine, Pra = Pyroaurite, Hdx = Hydroxide phase, Mgt = Magnetite.  
+
+\pagebreak
+```{r}
+SI_figure2
+```
+**Supplemental Figure 2**: Fe redox variogram, showing kernel density of pixels without gaussian smoothing applied to the centroid and intensity maps. Fe(III)/∑Fe is given by the variogram tielines at 10% intervals. Contour line envelopes that encompass 50%, 75%, and 90% of the total pixel kernel density are also shown.
+
+\pagebreak
+```{r}
+SI_figure3
+```
+**Supplemental Figure 3**: Corregistration of the XRF and Raman data sets. Control points in the $\text{TiO}_2$ component of the Raman mineralogy map (orange) and the Ti X-ray fluorescence map were chosen in order to calculate and apply an affine transformation. The resulting transformation of the Ti X-ray fluorescence map is shown (yellow overlay with transparency). 
+
+\pagebreak
+```{r}
+SI_figure4
+```
+**Supplemental Figure 4**: Distribution of errors due to orientation effects. Sine function fit to measured orientation errors in antigorite, which is given by $f(\varphi) = -0.021 + 0.073\sin\left(\frac{2\pi}{180^\circ}\varphi + \frac{\pi}{2}\right)$, where $\varphi$ is the orientation angle in degrees [A, modified from @munoz_iron_2013]. Arcsine probability density distribution resulting from the orientation error, which is given by $p(f) = \frac{1}{\pi\sqrt{0.073^2-(-0.021-f)^2}}$ for $-9.4\% < f < 5.2\%$ and $p(f) = 0$ everywhere else (B).
+
+# References

@@ -1,0 +1,2409 @@
+---
+title: 'R code for quantitative redox mapping analysis'
+author: "Eric T. Ellison, Lisa E. Mayhew, Hannah M. Miller, and Alexis S. Templeton"
+output:
+  html_document:
+    highlight: tango
+editor_options:
+  chunk_output_type: inline
+---
+
+# Setup
+## Document setup
+```{r setup, message = FALSE, warning = FALSE}
+library(akima)
+library(furrr)
+library(tidyverse)
+library(readxl)
+library(rprojroot)
+
+nest <- nest_legacy
+unnest <- unnest_legacy
+
+root_path <- function(...){rprojroot::find_root_file(..., criterion = is_git_root)}
+
+knitr::opts_chunk$set(
+  dev = c("cairo_pdf"), 
+  dev.args = list(pdf = list(encoding = "WinAnsi", useDingbats = FALSE)),
+  fig.keep = "all", 
+  fig.path = file.path("fig_output", "Ellison_etal_2019_"),
+  fig.align = "center",
+  message = FALSE, 
+  warning = FALSE)
+
+theme_eric <- theme_classic() + 
+  theme(axis.text = element_text(color = "black", size = 12), 
+        panel.border = element_rect(color = "black", fill = NA, size = 1.1), 
+        axis.line = element_blank(),
+        axis.ticks.length = unit(1.75, "mm"),
+        axis.title = element_text(color = "black", size = 16),
+        axis.title.y = element_text(margin = margin(t = 0, r = 10, b = 0, l = 10)),
+        axis.title.x = element_text(margin = margin(t = 10, r = 0, b = 10, l = 0)))
+
+```
+
+## General Funtions
+### Data import functions
+```{r import_functions}
+# Import a raw xrf map from HDF5
+#
+# This function is designed to import a raw XRF map saved in the HDF5 format
+# from Stanford Synchrotron Radiation Lightsource Beamline 2-3.
+
+
+rdx_read_file <- function(file_path, quiet = FALSE) {
+  
+  # safety check
+  stopifnot(file.exists(file_path)) # Safety check to make sure file exists.
+  
+  # info
+  if (!quiet) {
+    glue::glue("Info: reading file '{basename(file_path)}'... ") %>%
+      message(appendLF = FALSE)
+  }
+  
+  # read all data from file
+  all_data <- rhdf5::h5read(file_path, "/main", read.attributes = T)  # Read the HDF5 file.
+  channel_data <- dplyr::data_frame(channel = c("x", "y", attr(all_data, "labels")), 
+                                    ci = 1:length(channel)) # Read the channel names from 'labels'
+  
+  # parse map data
+  map_data <-
+    all_data$mapdata %>%
+    # turn array into df
+    as.data.frame.table() %>% dplyr::tbl_df() %>%
+    # index base dimensions
+    dplyr::mutate_if(is.factor, as.integer) %>%
+    # give more informative names
+    dplyr::rename(ci = Var1, xi = Var2, yi = Var3, value = Freq) %>%
+    # add channel names
+    dplyr::left_join(channel_data, by = "ci")
+  
+  # safety check
+  missing_channels <- dplyr::filter(map_data, is.na(channel))
+  if (nrow(missing_channels) > 0) {
+    glue::glue(
+      "{nrow(missing_channels)} out of {nrow(map_data)} data points in ",
+      "'{basename(file_path)}' do not have a channel and will be ignored") %>%
+      warning()
+    map_data <- dplyr::filter(map_data, !is.na(channel))
+  }
+  
+  # spread wide to have 1 column per channel
+  map_data_wide <- map_data %>% dplyr::select(-ci) %>%
+    # spread by channel
+    tidyr::spread(channel, value) %>%
+    # pull x and y coordinates out in front
+    dplyr::select(xi, x, yi, y, tidyselect::everything())
+  
+  # metadata
+  meta_data <- dplyr::data_frame(
+    energy = attr(all_data, "energy"),
+    origin = attr(all_data, "origin"),
+    channels = attr(all_data, "channels"),
+    collection_time = file.mtime(file_path)
+  )
+  
+  # safety check - metadata record should only be 1 row long
+  if (nrow(meta_data) != 1) {
+    glue::glue(
+      "metadata for file '{basename(file_path)}' has {nrow(meta_data)} records ",
+      "only 1 is allowed") %>%
+      warning()
+  }
+  
+  # final data
+  map_data_wide_w_metadata <- meta_data %>% dplyr::mutate(map_data = list(map_data_wide))
+  
+  # info
+  if (!quiet) {
+    message("complete.")
+  }
+  
+  return(map_data_wide_w_metadata)
+}
+
+
+# Import all HDF5 files in a folder into a combined map dataset.
+#
+# This function is designed to import a set of raw XRF maps, collected over 
+# the same map area at multiple energies, and saved in the HDF5 format from
+# Stanford Synchrotron Radiation Lightsource Beamline 2-3.
+
+# Read all files in a folder
+rdx_read_folder <- function(dir_path, quiet = FALSE) {
+  # safety check
+  stopifnot(dir.exists(dir_path))
+  # all .hdf5 files
+  all_files <- list.files(path = dir_path, pattern = ".hdf5", full.names = TRUE, recursive = FALSE)
+  # info
+  if (!quiet) {
+    glue::glue("Info: found {length(all_files)} hdf5 files in folder {basename(dir_path)}...") %>%
+      message()
+  }
+  # read all
+  dplyr::data_frame(
+    file_path = all_files,
+    file_name = basename(file_path),
+    file_data = purrr::map(file_path, rdx_read_file, quiet = quiet)
+  ) %>%
+    dplyr::select(-file_path) %>%
+    tidyr::unnest_legacy(file_data) %>%
+    return()
+}
+
+# Pivot a multiple energy map dataset.
+#
+# This function takes a multiple energy dataset with nested data for each excitation energy,
+# and "pivots" it into a tibble with a row for each pixel in the map, 
+# columns for the various XRF elements, and a nested tibble for the Fe pre-edge.
+
+
+
+rdx_peme_pivot <- function(data){
+  tmp_data <- data %>%
+    tidyr::unnest_legacy() %>%
+    dplyr::select(-c(file_name, origin, channels, I1, I1STRM, I2, I0, ICR, OCR, PDSTRM, Znb)) %>% #Scatt
+    tidyr::gather(channel, signal, Ca:Zn)
+  
+  FeData <- tmp_data %>%
+    dplyr::filter(channel %in% c("Fe", "I0STRM")) %>% # Working just on the normalized Fe measurements now
+    tidyr::spread(channel, signal) %>%
+    dplyr::select(-collection_time) %>%
+    tidyr::nest_legacy(c(energy, I0STRM, Fe), .key = FeData) # nest the measurements into a tibble for each column
+  
+  XRF <- tmp_data %>% # Going back to the data for all elements, not normFe now
+    dplyr::filter(energy == max(energy)) %>% # Data for excitation energies < 7200 are redundant.
+    tidyr::spread(channel, signal) %>% # Undoing the gather opperation above.
+    dplyr::select(-c(energy, I0STRM), I0STRM) %>%  # Organizing columns.
+    dplyr::rename(I0STRM_max = I0STRM, Fe_max = Fe)
+  
+  clean_data <- dplyr::inner_join(XRF, FeData, by = c("xi", "x", "yi", "y"))
+  
+  return(clean_data)
+}
+
+# Import a spectrum
+#
+# This function reads in an XAS spectrum from an XDI data file.
+
+rdx_read_spectrum <- function(file_path){
+  
+  stopifnot(file.exists(file_path)) # Safety check to make sure file exists.
+  
+  column_names <- readLines(file_path) %>%
+    grep(pattern = "#", value = TRUE) %>%
+    last() %>%
+    str_split("\t") %>%
+    unlist() %>%
+    `[`(-1)
+  
+  foil_data <- read.delim(file_path, sep = "\t", comment = "#", header = FALSE) %>%
+    as_tibble() %>%
+    select(-which(apply(., 2, function(x){all(is.na(x))}))) %>%
+    magrittr::set_colnames(column_names)
+  
+  return(foil_data)
+}
+
+# Import a folder of spectra
+
+rdx_read_folder_spectra <- function(dir_path, quiet = TRUE){
+  # safety check
+  stopifnot(dir.exists(dir_path))
+  # all .hdf5 files
+  all_files <- list.files(path = dir_path, pattern = ".xdi", full.names = TRUE, recursive = FALSE)
+  # info
+  if (!quiet) {
+    glue::glue("Info: found {length(all_files)} hdf5 files in folder {basename(dir_path)}...") %>%
+      message()
+  }
+  # read all
+  data_frame(
+    file_path = all_files,
+    file_name = basename(file_path),
+    file_time = lubridate::as_datetime(file.mtime(file_path)),
+    file_data = purrr::map(file_path, rdx_read_spectrum)
+  ) %>%
+    select(-file_path) %>%
+    return()
+}
+
+# Read "monoscans" (data sweeps on foil using same tracking algorithms as maps, different from XANES spectra)
+rdx_read_monoscan <- function(file_path){
+  
+  stopifnot(file.exists(file_path))
+  
+  column_names <- readLines(file_path) %>%
+    grep(pattern = "#", value = TRUE) %>%
+    last() %>% # The last commented line contains the column headers.
+    str_split("\t") %>%
+    unlist() %>%
+    `[`(-length(.)) %>%  # remove the last value, which is empty
+    str_replace("#MONO", "energy")
+  
+  
+  mono_data <- read.delim(file_path, sep = "\t", comment = "#", header = FALSE) %>%
+    as_data_frame() %>%
+    
+    # Some spectra have a column of NA's that should be removed. 
+    select(-which(apply(., 2, function(x){all(is.na(x))}))) %>% 
+    magrittr::set_colnames(column_names)
+  
+  return(mono_data)
+}
+```
+
+### Calibration functions
+```{r calibration_functions}
+# Apply an energy calibration shift
+#
+# Apply an energy calibration to a multiple energy map object. 
+# The energy column updated with a constant shift added.
+# The unshifted energy is appended in a column called old_energy.
+
+
+rdx_calibrate_energy <- function(data, shift){
+  #Safety check
+  stopifnot(is.numeric(shift) & length(shift) == 1) # Requires a numeric argument shift (length 1).
+  
+  shifted_data <- data %>%  # Should consider rewriting without tidyverse.
+    tidyr::unnest_legacy() %>%
+    dplyr::mutate(old_energy = energy) %>% # Save the unshifted energy.
+    dplyr::mutate(energy = energy + shift) %>% # Shift is added to energy and overwritten to energy.
+    tidyr::nest_legacy(energy, old_energy, I0STRM, Fe, .key = FeData)
+  
+  return(shifted_data)
+}
+
+# Normalize to I0
+#
+# Normalize fluorescence to incident beam intensity.
+
+
+rdx_normalize_I0 <- function(data){
+  data <- data %>%
+    tidyr::unnest_legacy() %>%
+    dplyr::mutate(Fe_I0 = Fe / I0STRM) %>%
+    tidyr::nest_legacy(energy, old_energy, I0STRM, Fe, Fe_I0, .key = FeData)
+  return(data)
+}
+
+
+# Normalize to a map above the edge.
+#
+# Normalize fluorescence intensities to a channel above the edge.
+
+rdx_edge_normalize <- function(data){
+  
+  norm_data <- data %>%
+    unnest(FeData) %>%
+    group_by(xi, yi) %>%
+    dplyr::mutate(normFluor = Fe_I0/max(Fe_I0))
+  
+  return(norm_data)
+}
+
+# Find the inflection point in a foil spectrum.
+
+rdx_find_inflection <- function(data, smoothing = 0.6){
+  
+  energy <- data %>% select(energy) %>% unlist()
+  foil <- data %>% select(Fe_I0) %>% unlist()
+  
+  smoothFoil <- predict(smooth.spline(energy, foil, spar = smoothing), seq(7110,7114,by=0.01), 1)
+  smoothFoil <- tibble(Energy = smoothFoil$x, Spline = smoothFoil$y)
+  
+  IP <- smoothFoil %>%
+    filter(Spline == max(Spline)) %>%
+    select(Energy) %>%
+    as.numeric()
+  
+  return(IP)
+}
+
+# Apply deadtime correction, given tau measured from ICR-OCR curve. 
+rdx_deadtime_correct <- function(data, tau){
+  
+  # OCR = ICR * exp(-ICR * tau)
+  # thus the corrected value yi for any element xi is
+  # yi = xi * exp(ICR * tau)
+  
+  unnest(data) %>% 
+    mutate_at(vars(-c(file_name:y, I0:ICR, OCR, PDSTRM, TIME)), 
+              function(x){x * exp(tau*.$ICR)}) %>% 
+    group_by(file_name, energy, origin, channels, collection_time) %>% 
+    nest(.key = map_data)
+}
+```
+
+
+### Baseline functions
+```{r baseline_functions}
+# Fit a baseline to a pre-edge spectrum.
+#
+# A baseline is fit through the spectrum provided. The baseline is an exponential function through
+# two of the provided points, such that all other points fall above the baseline. The baseline itself,
+# the points chosen for fitting the baseline, the baseline-corrected peak, the pre-edge centroid, and
+# integrated intensity are provided.
+
+
+rdx_baseline_fit <- function(fluor, energy, energy_out = energy){
+  
+  # Initial guess for the baseline points (first and last values).
+  bl_points <- energy[c(1, length(energy))] 
+  
+  iterations <- 1 # Counter.
+  
+  # Begining with the initial guess above, a baseline is iteratively fit through the points.
+  # The function then replaces the baseline points with the points falling farthest beneath the
+  # baseline fit.
+  while(iterations < 11){
+    oldBL <- bl_points # Save the current baseline points for later comparison.
+    
+    # Calculate the exponential slope from the left baseline point to all other points.
+    slope <- (log(fluor) - log(fluor[energy == bl_points[1]])) / (energy - bl_points[1])
+    
+    # The baseline point on the right side of the peak (e >= 7114) is updated with the one with
+    # the smallest slope.
+    bl_points[2] <- energy[which(slope == min(slope[energy >= 7114], na.rm = TRUE))]
+    
+    # Calculate the exponential slope from the right baseline point to all other points.
+    slope <- (log(fluor[energy == bl_points[2]]) - log(fluor)) / (bl_points[2] - energy)
+    
+    # The baseline point on the left side of the peak (e <= 7114) is updated with the one with
+    # the greatest slope.
+    bl_points[1] <- energy[which(slope == max(slope[energy < 7114], na.rm = TRUE))]
+    if (all(oldBL == bl_points)) break # Check if the baseline points were updated by this iteration.
+    iterations <- iterations + 1 # Increment the counter.
+  }
+  
+  points <- bl_points #These are just the BL points selected above.
+  
+  # The slope of the exponential fit.
+  a <- (log(fluor[energy == bl_points[2]]) - log(fluor[energy == bl_points[1]])) / 
+    (bl_points[2] - bl_points[1])
+  
+  b <- log(fluor[energy == bl_points[1]]) # The intercept of the fit.
+  baseline_e <- exp(a * (energy-bl_points[1]) + b) # The baseline fit evaluated at e.
+  baseline_eout <- exp(a * (energy_out-bl_points[1]) + b) # The baseline fit evaluated at energy_out.
+  
+  peak <- fluor - baseline_e # Baseline-subtracted intensities.
+  
+  # Only the points between the 2 BL points are included.
+  peak[energy < bl_points[1] | energy > bl_points[2]] <- 0 
+  
+  centroid <- sum(peak * energy) / sum(peak)
+  
+  intensity <- as.numeric(0.5 * (energy[-1] - energy[-length(energy)]) %*% (peak[-1] + peak[-length(peak)]))
+  
+  fit <- list(
+    centroid = centroid,
+    intensity = intensity,
+    points = points,
+    baseline = baseline_eout,
+    peak = peak
+  )
+  
+  return(fit)
+}
+
+# Compute the centroid or intensity of a pre-edge spectrum.
+# Wrappers for baseline_fit returning the centroid or intensity of the
+# input spectrum.
+
+rdx_centroid <- function(fluor, energy){
+  fit <- rdx_baseline_fit(fluor, energy)
+  return(fit$centroid)
+}
+
+rdx_intensity <- function(fluor, energy){
+  fit <- rdx_baseline_fit(fluor, energy)
+  return(fit$intensity)
+}
+
+# Smooth a matrix using a gaussian kernel.
+
+rdx_gauss_filter <- function(x, sigma = 1) {
+  dim <- 2 * floor(sigma * 7 / 2) + 1
+  d <- dnorm((-(dim - 1) / 2) : ((dim - 1) / 2), sd = sigma)
+  x.smooth <- x %>%
+    raster::raster() %>%
+    raster::focal(w = (d %*% t(d))/sum(d %*% t(d)),
+                  fun = "sum", na.rm = TRUE, pad = TRUE) %>%
+    raster:::as.matrix()
+  x.norm <- matrix(1, nrow(x), ncol(x)) %>%
+    raster::raster() %>%
+    raster::focal(w = (d %*% t(d))/sum(d %*% t(d)),
+                  fun = "sum", na.rm = TRUE, pad = TRUE) %>%
+    raster:::as.matrix()
+  x.smooth/x.norm
+}
+
+```
+
+### Accessory functions
+```{r}
+rmse <- function(x, na.rm = TRUE){sqrt(mean(x^2, na.rm = na.rm))}
+```
+
+# Calibration
+## Foil XANES calibration
+```{r foil_xanes_calibration}
+foils <- data_frame(
+  file_path = list.files(path = root_path("data/Foils"), 
+                         full.names = TRUE, recursive = FALSE),
+  foil_name = basename(file_path),
+  time = purrr::map(file_path, ~lubridate::as_datetime(file.mtime(.))),
+  data = purrr::map(file_path, ~ rdx_read_spectrum(.) %>% 
+                      mutate(Fe_I0 = FF1/I0)),
+  IP = purrr::map(data, . %>% 
+                    filter(energy >= 7108 & energy <= 7116) %>% 
+                    rdx_find_inflection(smoothing = 0.6))
+) %>%   
+  unnest(time, IP) %>%
+  select(-file_path) %>%
+  mutate(type = "spectrum") %>% 
+  left_join(read_csv("data/data_collection_times.csv", 
+                     col_type = cols(
+                       file_name = col_character(),
+                       data_type = col_character(),
+                       scan_time = col_character())) %>% 
+              filter(data_type == "Foil_spectrum") %>% 
+              select(-data_type),
+            by = c("foil_name" = "file_name")) %>% 
+  mutate(time = lubridate::as_datetime(scan_time)) %>% 
+  select(-scan_time)
+
+# Define a function that takes an analysis time and returns the mean of the bracketing foil spectra. 
+spectrum_cal <- approxfun(foils$time, foils$IP, method = "constant", f = 0.5, rule = 2)
+
+
+```
+
+## Shifting XANES and find centroid/intensity
+```{r processing_xanes}
+# Define the energies maps were collected at. 
+energy.seq <- c(7109,7110.1,7111.2,7112.3,7113.4,7114.2,7114.8,7115.8,7117.2,7200)
+
+xanes_spectra <- rdx_read_folder_spectra(root_path("data/xanes")) %>% 
+  unnest() %>% 
+  group_by(file_name, file_time) %>% 
+  left_join(read_csv("data/data_collection_times.csv", 
+                     col_type = cols(
+                       file_name = col_character(),
+                       data_type = col_character(),
+                       scan_time = col_character())
+  ) %>% 
+    filter(data_type == "XANES") %>% 
+    select(-data_type), 
+  by = "file_name") %>% 
+  ungroup() %>% 
+  mutate(file_time = lubridate::as_datetime(scan_time)) %>% 
+  select(-scan_time) %>% 
+  
+  mutate(oldEnergy = energy,
+         shift = case_when(grepl("shifted", file_name) ~ 0,
+                           !grepl("shifted", file_name) ~ 7112 - spectrum_cal(file_time)),  
+         energy = energy + shift,
+         Fe_I0 = case_when(!is.na(mu) ~ mu,
+                           is.na(mu) ~ FF1 / I0)) %>% 
+  group_by(file_name, file_time, shift) %>% 
+  nest(-c(file_name, file_time, shift)) 
+
+# Downsample the XANES spectra and process using the multiple energy map methods
+xanes_spectra <- left_join(xanes_spectra, xanes_spectra %>% 
+                             ungroup() %>% 
+                             mutate(meData = purrr::map(xanes_spectra$data, 
+                                                        ~tibble(energy = energy.seq, 
+                                                                Fe_I0 = approx(.$energy, 
+                                                                               .$Fe_I0, 
+                                                                               energy.seq)$y))) %>%
+                             unnest(meData) %>%
+                             group_by(file_name) %>% 
+                             mutate(normFluor = Fe_I0 / last(Fe_I0)) %>%
+                             filter(energy != max(energy)) %>%
+                             mutate(me.centroid = rdx_centroid(normFluor, energy), 
+                                    me.intensity = rdx_intensity(normFluor, energy)) %>% 
+                             ungroup() %>% 
+                             nest(energy:normFluor) %>% 
+                             select(file_name, me.centroid, me.intensity),
+                           by = "file_name")
+
+# Process the XANES spectra using the multiple energy map methods, but with full spectrum resolution
+xanes_spectra <- left_join(xanes_spectra, xanes_spectra %>% 
+                             mutate(peData = purrr::map(.$data, ~filter(., between(energy, 7108, 7120) |
+                                                                          rank(abs(energy - 7200)) == 1))) %>%
+                             unnest(peData) %>%
+                             group_by(file_name) %>% 
+                             mutate(normFluor = Fe_I0 / last(Fe_I0)) %>%
+                             filter(energy != max(energy)) %>%
+                             mutate(pe.centroid = rdx_centroid(normFluor, energy), 
+                                    pe.intensity = rdx_intensity(normFluor, energy)) %>% 
+                             ungroup() %>% 
+                             nest(energy:normFluor) %>% 
+                             select(file_name, pe.centroid, pe.intensity),
+                           by = "file_name")
+
+```
+
+## Finding inflection points of monochromator scans
+```{r Mono_scans}
+
+monos <- data_frame(
+  file_path = list.files(path = "data/monoscans/", full.names = TRUE, recursive = FALSE),
+  foil_name = basename(file_path),
+  time = map(file_path, ~ lubridate::as_datetime(file.mtime(.))),
+  data = map(file_path, ~ rdx_read_monoscan(.) %>% 
+               mutate(Fe_I0 = FF1/I0)),
+  inflection.point = map(data, . %>% 
+                           filter(energy >= 7108 & energy <= 7116) %>% 
+                           rdx_find_inflection(smoothing = 0.7))) %>% 
+  unnest(time, inflection.point) %>%
+  select(-file_path)
+
+monos <- monos %>% 
+  left_join(read_csv("data/data_collection_times.csv", 
+                     col_type = cols(
+                       file_name = col_character(),
+                       data_type = col_character(),
+                       scan_time = col_character())) %>% 
+              filter(data_type == "Mono_scan") %>% 
+              select(-data_type), 
+            by = c("foil_name" = "file_name")) %>% 
+  mutate(time = lubridate::as_datetime(scan_time)) %>% 
+  select(-scan_time)
+
+# Define a function that takes an analysis time and returns the mean of the bracketing foil spectra. 
+mono_shift <- mean(monos$inflection.point - spectrum_cal(monos$time))
+
+map_cal <- function(time){approxfun(foils$time, 
+                                    foils$IP, 
+                                    method = "constant", 
+                                    f = 0.5, 
+                                    rule = 2)(time) + mono_shift}
+
+
+```
+
+
+## Calibrating Variogram
+
+```{r calibrate_variogram}
+standards <- tibble(sample_name = c("Andradite", "olivine", "Siderite", "staurolite", "Sanidine"), 
+                    Redox = c(1, 0, 0, 0, 1), 
+                    Coordination = c(6, 6, 6, 4, 4))
+
+measured_standards <- xanes_spectra %>% 
+  group_by(file_name, file_time, pe.centroid, pe.intensity) %>% 
+  mutate(sample_name = case_when(!grepl("shifted", file_name) ~
+                                   str_split(file_name,"_[[:digit:]]{3}_[[:digit:]]{3}.xdi$", 
+                                             simplify = TRUE)[ , 1],
+                                 grepl("shifted", file_name) ~ 
+                                   str_split(file_name,"_", 
+                                             simplify = TRUE)[ , 2])) %>% 
+  filter(grepl(paste("[Oo]liv", 
+                     "[Ss]iderite", 
+                     "[Ss]taurolite", 
+                     "[Aa]ndradite", 
+                     "[Ss]anidine", 
+                     sep = "|"), 
+               sample_name)) %>% 
+  arrange(sample_name) %>% 
+  ungroup() %>% 
+  inner_join(standards, by = "sample_name") %>% 
+  select(sample_name, Redox, Coordination, pe.centroid, pe.intensity) %>% 
+  group_by(Redox, Coordination) 
+
+measured_standards_centroids <- measured_standards %>% 
+  
+  # Can't use andradite as a centroid standard (intermediate redox).
+  filter(sample_name != "Andradite") %>% 
+  
+  summarise(meas_centroid = mean(pe.centroid)) 
+
+measured_standards_intensity <- measured_standards %>% 
+  summarise(meas_intensity = mean(pe.intensity)) 
+
+measured_standards <- right_join(measured_standards_centroids, 
+                                 measured_standards_intensity, 
+                                 by = c("Redox", "Coordination"))
+
+raw_variogram <- read_csv(root_path("data/Raw_variogram_Andreani_8Oct18.csv"))
+
+variogram_stds <- raw_variogram %>% 
+  filter(Redox %in% c(0, 1)) %>% 
+  inner_join(measured_standards, by = c("Redox", "Coordination"))
+
+centroid_fit <- lm(meas_centroid ~ Centroid, data = variogram_stds)
+intensity_fit <- lm(meas_intensity ~ Intensity, data = variogram_stds)
+
+shifted_variogram <- raw_variogram %>% 
+  mutate(meas_centroid = predict(centroid_fit, .), 
+         meas_intensity = predict(intensity_fit, .)) %>% 
+  select(-Centroid, -Intensity) %>% 
+  rename(Centroid = meas_centroid, Intensity = meas_intensity) %>% 
+  filter(!(Redox == 0.0 & Coordination == 4)) %>% 
+  arrange(Redox, desc(Coordination))
+
+shifted_variogram2 <- raw_variogram %>% 
+  mutate(meas_centroid = predict(centroid_fit, .), 
+         meas_intensity = predict(intensity_fit, .)) %>% 
+  select(-Centroid, -Intensity) %>% 
+  rename(centroid = meas_centroid, intensity = meas_intensity) %>% 
+  arrange(Redox, desc(Coordination))
+
+tielines <- numeric()
+for(i in unique(shifted_variogram$Redox)){
+  line <- lm(Centroid ~ Intensity, data = shifted_variogram, 
+             subset = (shifted_variogram$Redox == i))$coefficients
+  int_seq <- seq(0.01, last(shifted_variogram$Intensity[shifted_variogram$Redox == i]), 
+                 by = 0.01)
+  tielines <- rbind(tielines, 
+                    cbind(rep(i, length(int_seq)),
+                          int_seq*line[2]+line[1],
+                          int_seq
+                    )
+  )
+  
+}
+
+upper_join <- shifted_variogram2 %>% 
+  filter((Coordination == 4 & Redox != 0) | (Coordination == 6 & Redox == 0)) %>% 
+  select(centroid, intensity)
+
+tielines <- tielines %>% as_tibble()
+colnames(tielines) <- c("Redox", "Centroid", "Intensity")
+tielines$Centroid[tielines$Redox == 0] <- 
+  shifted_variogram$Centroid[shifted_variogram$Redox == 0 & shifted_variogram$Coordination == 6]
+```
+
+# OM14-07 Redox map
+## Load pre-edge multiple energy map
+```{r loading_PEME_map}
+# Read in the PEME map
+meData <- rdx_read_folder(root_path("data/ME_maps"), quiet = TRUE)
+
+# Determine deadtime correction
+deadtime <- meData %>% 
+  unnest() %>% 
+  filter(xi != 1) %>% 
+  filter(ICR>0, OCR>0) %>% 
+  mutate(y = log(ICR / 90e-3) - log(OCR / 90e-3),
+         x = ICR / 90e-3) %>% 
+  lm(formula = y ~ 0 + x) %>% 
+  coefficients()
+
+meData <- meData %>% 
+  
+  # Apply deadtime correction
+  rdx_deadtime_correct(tau = deadtime) %>% 
+  
+  # Use the pivot function to transform the dataframe. 
+  rdx_peme_pivot() %>% 
+  
+  # Apply the energy calibration
+  rdx_calibrate_energy(shift = 7112 - map_cal(first(.$collection_time))) %>% 
+  
+  # Normalize the Fe Fluorescence data to the incident X-ray beam 
+  # and to the total Fe fluorescence above the edge
+  rdx_normalize_I0() %>% 
+  
+  rdx_edge_normalize() %>% 
+  
+  # Clean up...
+  unnest() %>% 
+  group_by(xi, yi) %>% 
+  filter(!(xi %in% c(1, 206)) & !(yi %in% c(1))) %>% # bad rows.
+  
+  # Compute the centroid and intensity of the pre-edge feature at every pixel
+  mutate(centroid = rdx_centroid(normFluor[-10], energy[-10])) %>% 
+  mutate(intensity = rdx_intensity(normFluor[-10], energy[-10])) %>% 
+  
+  # Clean up again
+  ungroup() %>% 
+  nest(energy : normFluor, .key = FeData)
+
+
+
+```
+
+## Set up variogram plotting
+```{r variogram_plotting}
+plot.variogram <- function(color = "red"){
+  list(
+    vgrampt = geom_point(
+      aes(centroid, intensity),
+      data = shifted_variogram2 %>% filter(Redox %in% c(0, 1)),
+      inherit.aes = FALSE,
+      shape = 21,
+      size = 5,
+      fill = color,
+      color = "black"),
+    
+    vgramsegs = geom_segment(
+      aes(
+        x = x,
+        y = y,
+        xend = xend,
+        yend = yend),
+      
+      data = tibble(
+        x = shifted_variogram2$centroid[shifted_variogram2$Coordination == 6],
+        y = shifted_variogram2$intensity[shifted_variogram2$Coordination == 6],
+        xend = shifted_variogram2$centroid[shifted_variogram2$Coordination == 4],
+        yend = shifted_variogram2$intensity[shifted_variogram2$Coordination == 4]
+      ),
+      inherit.aes = FALSE,
+      color = color),
+    
+    vgrampoly = geom_polygon(
+      aes(centroid, intensity),
+      data = (shifted_variogram2 %>% filter(Redox %in% c(0, 1)))[c(1, 2, 4, 3), ],
+      inherit.aes = FALSE,
+      fill = NA,
+      color = color,
+      size = 1),
+    
+    vgram_redox_axis =  list(
+      annotate("text", x = shifted_variogram2$centroid[shifted_variogram2$Coordination == 6], 
+               y = shifted_variogram2$intensity[shifted_variogram2$Coordination == 6] - 0.012,
+               label = paste0(seq(0,100, by = 10), "%"), color = color, angle = 45, size = 2.5), 
+      annotate("text", 
+               x = shifted_variogram2$centroid[shifted_variogram2$Coordination == 6 &
+                                                 shifted_variogram2$Redox == 0.5], 
+               y = shifted_variogram2$intensity[shifted_variogram2$Coordination == 6 & 
+                                                  shifted_variogram2$Redox == 0.5] - 0.0275, 
+               label = "Fe(III)/∑Fe", color = color, size = 3))
+  )
+}
+```
+
+## Redox calculations
+```{r PEME_redox_calculations}
+
+meData <- meData %>% 
+  filter(!is.na(centroid)) %>% 
+  
+  # Points falling above the [6]Fe(II)-[4]Fe(III) are invalid
+  mutate(out.of.bounds = intensity > approx(upper_join$centroid, upper_join$intensity, centroid)$y, 
+         
+         redox = case_when(!out.of.bounds ~ 
+                             interpp(x = tielines$Centroid, 
+                                     y = tielines$Intensity, 
+                                     z = tielines$Redox, 
+                                     xo = .$centroid, 
+                                     yo = .$intensity, 
+                                     duplicate = "mean")$z,
+                           out.of.bounds ~ NA_real_)) 
+
+# Applying gaussian smooth to the centroid and intensity maps, then calculating the redox map with the smoothed data
+meData <- meData %>% 
+  mutate(smooth.centroid = as.numeric(
+    rdx_gauss_filter(
+      matrix(
+        unlist(centroid), 
+        length(unique(yi)), 
+        length(unique(xi))), 
+      sigma = 1)),
+    smooth.intensity = as.numeric(
+      rdx_gauss_filter(
+        matrix(
+          unlist(intensity),
+          length(unique(yi)), 
+          length(unique(xi))),
+        sigma = 1)),
+    
+    # Points falling above the [6]Fe(II)-[4]Fe(III) are invalid
+    out.of.bounds.smooth = smooth.intensity > approx(upper_join$centroid, 
+                                                     upper_join$intensity, 
+                                                     smooth.centroid)$y, 
+    
+    smooth.redox = case_when(!out.of.bounds.smooth ~ 
+                               interpp(x = tielines$Centroid, 
+                                       y = tielines$Intensity, 
+                                       z = tielines$Redox, 
+                                       xo = smooth.centroid, 
+                                       yo = smooth.intensity, 
+                                       duplicate = "mean")$z,
+                             out.of.bounds.smooth ~ NA_real_))
+```
+
+## Figure 1 pre-edge schematic
+```{r Figure1, fig.height = 9, fig.width = 10.5}
+
+example_spectrum <- xanes_spectra %>% 
+  filter(file_name == "OM14_07_003_001.xdi") %>% 
+  unnest(data) %>% 
+  mutate(normFluor = Fe_I0/filter(., rank(abs(energy - 7200)) == 1)$Fe_I0)
+
+
+map_coords <- readLines(root_path("data/xanes/OM14_07_003_001.xdi")) %>% 
+  grep(pattern = "#", value = TRUE) %>% 
+  str_split("\t") %>% 
+  unlist() %>% 
+  grep(pattern = "YAXIS|ZAXIS", value = TRUE) %>% 
+  str_extract_all(pattern = "-?\\d*\\.?\\d*") %>% 
+  unlist() %>% 
+  as.numeric() %>% 
+  magrittr::extract(!is.na(.))
+
+pixel_coordinates <- meData %>% 
+  filter(abs(x - map_coords[1]) == min(abs(x - map_coords[1])), 
+         abs(y - map_coords[2]) == min(abs(y - map_coords[2]))) %>% 
+  select(xi, yi) %>% 
+  unlist()
+
+
+fig1a <- meData %>% 
+  filter(xi %in% (pixel_coordinates["xi"] + (-1:1)), 
+         yi %in% (pixel_coordinates["yi"] + (-1:1))) %>% 
+  unnest(FeData) %>% 
+  ungroup() %>% group_by(energy) %>% summarize(normFluor = mean(normFluor)) %>% 
+  
+  ggplot(aes(x = energy, y = normFluor)) +
+  geom_line(data = example_spectrum, size = 1) +
+  geom_segment(aes(xend = energy, yend = 0), linetype = 2, color = "steelblue", size = 1) +
+  geom_point(shape = 21, 
+             fill = "steelblue",
+             size = 2) +
+  theme_eric + 
+  scale_y_continuous(expand = c(0,0)) + 
+  labs(x = "Excitation Energy (eV)",
+       y = "Normalized Fe Fluorescence") +
+  coord_cartesian(xlim = c(7100, 7220), ylim = c(0, 1.6))+
+  theme(plot.margin = margin(10, 20, 10, 10))
+
+
+mePix <- meData %>% 
+  filter(xi %in% (pixel_coordinates["xi"] + (-1:1)), 
+         yi %in% (pixel_coordinates["yi"] + (-1:1))) %>% 
+  unnest(FeData) %>% 
+  ungroup() %>% group_by(energy) %>% summarize(normFluor = mean(normFluor))
+
+fig1b <- mePix %>%   
+  ggplot(aes(x = energy, y = normFluor)) +
+  geom_line(data = example_spectrum, size = 1) +
+  geom_segment(aes(xend = energy, yend = 0), linetype = 2, color = "steelblue", size = 0.5) +
+  geom_line(data = data_frame(energy = seq(7108, 7122, by = 0.1)), 
+            aes(x = energy, 
+                y = rdx_baseline_fit(mePix$normFluor[-10], 
+                                     mePix$energy[-10], 
+                                     seq(7108, 7122, by = 0.1))$baseline), 
+            linetype = 2, color = "darkred", size = 1) +
+  geom_point(shape = 21, fill = "steelblue", size = 3) +
+  geom_point(data = data_frame(energy = rdx_baseline_fit(mePix$normFluor[-10],
+                                                         mePix$energy[-10])$points,
+                               normFluor = mePix %>% 
+                                 filter(energy %in% rdx_baseline_fit(mePix$normFluor[-10],
+                                                                     mePix$energy[-10])$points) %>% 
+                                 select(normFluor) %>% 
+                                 unlist()),
+             size = 6, 
+             shape = 1, 
+             color = "red") +  
+  theme_eric + 
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0)) +
+  coord_cartesian(ylim=c(0, 0.08), xlim = c(7108, 7120)) +
+  labs(x = "Excitation Energy (eV)",
+       y = "Normalized Fe Fluorescence")+
+  theme(plot.margin = margin(10, 20, 10, 10))
+
+
+mePix <- mePix %>% filter(energy < 7200) %>% 
+  mutate(peak = rdx_baseline_fit(mePix$normFluor[-10], mePix$energy[-10])$peak)
+
+fig1c <- mePix %>% 
+  
+  ggplot(aes(x = energy, y = peak)) +
+  
+  geom_abline(slope = 0) +
+  
+  geom_area(fill = "blue", alpha = 0.3, color = "black") +
+  
+  annotate("segment", 
+           x = rdx_centroid(mePix$normFluor[-10], mePix$energy[-10]), 
+           y = approx(mePix$energy, 
+                      mePix$peak, 
+                      rdx_centroid(mePix$normFluor[-10], mePix$energy[-10]))$y, 
+           xend = rdx_centroid(mePix$normFluor[-10], mePix$energy[-10]), 
+           yend = 0, linetype= 2) + 
+  
+  geom_line(data = example_spectrum %>% 
+              filter(between(energy, 7105, 7122)) %>% 
+              mutate(baseline = rdx_baseline_fit(mePix$normFluor[-10], 
+                                                 mePix$energy[-10], energy)$baseline,
+                     peak = normFluor - baseline)) + 
+  
+  geom_point(shape = 21, fill = "steelblue", size = 3) +
+  annotate("text", 7111, c(0.02, 0.0125), 
+           label = c(paste0("Centroid = ", 
+                            round(rdx_centroid(mePix$normFluor[-10], 
+                                               mePix$energy[-10]), 2)), 
+                     paste0("Integrated \n intensity = ",
+                            round(rdx_intensity(mePix$normFluor[-10],
+                                                mePix$energy[-10]), 
+                                  3)))) +
+  annotate("segment", 
+           x = rep(7111,2), 
+           xend = c(rdx_centroid(mePix$normFluor[-10], mePix$energy[-10]), 7113), 
+           y = c(0.019, 0.011), 
+           yend = c(0.01, 0.005), 
+           arrow = arrow(length = unit(0.25, "cm")), 
+           size = 0.4)+
+  
+  theme_eric + 
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0)) +
+  coord_cartesian(ylim=c(-0.0025, 0.025), xlim = c(7108, 7120)) +
+  labs(x = "Excitation Energy (eV)",
+       y = "Normalized Fe Fluorescence")+
+  theme(plot.margin = margin(10, 20, 10, 10))
+
+fig1d <- data_frame(centroid = rdx_baseline_fit(mePix$normFluor[-10], 
+                                                mePix$energy[-10])$centroid, 
+                    intensity = rdx_baseline_fit(mePix$normFluor[-10], 
+                                                 mePix$energy[-10])$intensity) %>% 
+  ggplot(aes(x = centroid, y = intensity)) + 
+  lims(y = c(0, 0.3)) + 
+  plot.variogram("black") +
+  geom_errorbar(aes(ymin = intensity-0.007, ymax = intensity+0.007), width = 0.05, color = "steelblue") + 
+  geom_errorbarh(aes(xmin = centroid-0.1, xmax = centroid+0.1), height = 0.012, color = "steelblue") + 
+  annotate("text", c(7112.4, 7112.4, 7115.0, 7115.0), c(.04, .2, .04, .28), label = c(expression(""^"VI"*Fe(II)), expression(""^"IV"*Fe(II)), expression(""^"VI"*Fe(III)), expression(""^"IV"*Fe(III))), size = 4, hjust = c(0, 0, 1, 1)) +
+  geom_point(shape = 21, fill = "steelblue", size = 2.5) +
+  labs(x = "Centroid Position (eV)",
+       y = "Integrated Intensity") +
+  theme_eric +
+  theme(plot.margin = margin(10, 20, 10, 10)) 
+
+
+
+figure1 <- ggpubr::ggarrange(fig1a, fig1b, fig1c, fig1d, labels = "AUTO", align = "hv",
+                             label.x = 0.225, label.y = 0.95, font.label = list(size = 18))
+
+figure1 <- ggpubr::annotate_figure(figure1, 
+                                   bottom = ggpubr::text_grob("Figure 1", 
+                                                              face = "bold", 
+                                                              hjust = 0, 
+                                                              x = 0, 
+                                                              size = 14))
+# ggsave("Figure1.pdf", figure1, "pdf", width = 10.5, height = 9)
+
+figure1
+```
+
+
+## Figure 5 Fe fluorescence, centroid, and intensity maps
+```{r Figure5, fig.height = 8, fig.width = 6}
+#Setting up the maps. 
+g <- meData %>% 
+  ggplot() +
+  aes(x = x, y = y) +
+  geom_raster() +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0)) +
+  theme(panel.grid = element_blank()) +
+  coord_fixed(1 / sqrt(2)) + 
+  guides(fill = guide_colourbar(barheight = 8, barwidth = 1)) +
+  theme_eric +
+  
+  theme(axis.line=element_blank(),
+        axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank(), 
+        panel.border=element_blank(),
+        legend.position = c(1.01, 1.01),
+        legend.justification = c("left", "top")) +
+  
+  annotate("rect", 
+           xmin = min(meData$x), 
+           xmax = min(meData$x) + 0.05, 
+           ymin = min(meData$y) - 0.01, 
+           ymax = min(meData$y) - 0.015, 
+           fill = "black") +
+  
+  annotate("text", 
+           x = min(meData$x) + 0.025, 
+           y = min(meData$y) - 0.045, 
+           label = "50 µm", 
+           vjust = -0.5)
+
+
+# Map of Fe Fluorescence above the edge (~Fe concentration)
+fig5a <- g  + aes(fill = Fe_max / I0STRM_max / TIME * mean(TIME)) + 
+  labs(fill = "\nFe Fluorescence\nExcited at 7200 eV") +
+  scale_fill_viridis_c(option = "plasma", limits =  c(0, NA)) +
+  theme(plot.margin = margin(0, 100, 0, 0)) + 
+  annotate("text", 
+           x = c(-3.235, -3.43, -3.5, -3.33, -3.33), 
+           y = c(3.96, 3.88, 3.97, 3.84, 4.05), 
+           label = c("Ol", "Pra/Hdx", "Srp", "Srp", "Mgt"), 
+           color = c("white", "black", rep("white", 3)), 
+           size = 4, fontface = 1)
+
+fig5c <- g + aes(fill = smooth.centroid) + 
+  labs(fill = "Smoothed\nCentroid\nPosition (eV)") +
+  scale_fill_viridis_c(option = "plasma", limits = c(7112.25, 7114.75)) +
+  theme(plot.margin = margin(0, 100, 0, 0)) + 
+  annotate("text", 
+           x = c(-3.235, -3.43, -3.5, -3.33, -3.33), 
+           y = c(3.96, 3.88, 3.97, 3.84, 4.05), 
+           label = c("Ol", "Pra/Hdx", "Srp", "Srp", "Mgt"), 
+           color = c("white", rep("black", 4)), 
+           size = 4, fontface = 1)
+
+fig5e <- g + aes(fill = smooth.intensity) + 
+  labs(fill = "Smoothed\nIntegrated\nIntensity") +
+  scale_fill_viridis_c(option = "plasma", limits = c(0.02, 0.16)) +
+  theme(plot.margin = margin(0, 100, 0, 0)) + 
+  annotate("text", 
+           x = c(-3.235, -3.43, -3.5, -3.33, -3.33), 
+           y = c(3.96, 3.88, 3.97, 3.84, 4.05), 
+           label = c("Ol", "Pra/Hdx", "Srp", "Srp", "Mgt"), 
+           color = c(rep("white", 4), "black"), 
+           size = 4, fontface = 1)
+
+
+figure5 <- ggpubr::ggarrange(fig5a, fig5c, fig5e, 
+                             nrow = 3, 
+                             ncol = 1, 
+                             align = "hv",
+                             labels = "AUTO",
+                             label.x = 0.07, 
+                             label.y = 1,
+                             font.label = list(size = 15, color = "black", each = 2))
+
+figure5 <- ggpubr::annotate_figure(figure5, 
+                                   bottom = ggpubr::text_grob("Figure 5", 
+                                                              face = "bold", 
+                                                              hjust = 0, 
+                                                              x = 0, 
+                                                              size = 14))
+
+figure5
+
+```
+
+## Figure 6 pixel density variograms
+```{r Figure6, fig.width = 8, fig.height = 5}
+
+density.contours <- ks::kde(meData[ , c("centroid", "intensity")], 
+                            compute.cont=TRUE) %>%
+  with(contourLines(x=eval.points[[1]], 
+                    y=eval.points[[2]], 
+                    z=estimate, 
+                    levels=cont[c("10%", "25%", "50%")])) %>%
+  lapply(FUN = data.frame) %>% 
+  lapply(FUN = geom_path, mapping = aes(x,y), col = "white")
+
+smooth.contours <- ks::kde(meData[ , c("smooth.centroid", "smooth.intensity")], 
+                           compute.cont=TRUE) %>%
+  with(contourLines(x=eval.points[[1]], 
+                    y=eval.points[[2]], 
+                    z=estimate, 
+                    levels=cont[c("10%", "25%", "50%")])) %>%
+  lapply(FUN = data.frame) %>% 
+  lapply(FUN = geom_path, mapping = aes(x,y), col = "white")
+
+figure6 <- meData %>% 
+  ggplot(aes(x = .$smooth.centroid, y = .$smooth.intensity)) +
+  stat_density_2d(aes(fill = ..density..^(1/4)), 
+                  geom = "raster", 
+                  contour = FALSE, 
+                  hjust = 0, 
+                  vjust = 0, 
+                  n = 250, 
+                  show.legend = F) +
+  smooth.contours +
+  scale_x_continuous(limits = c(7112.2, 7114.95), 
+                     expand = c(0,0), 
+                     breaks = seq(7112.5, 7114.5, by = 0.5)) +
+  scale_y_continuous(limits = c(0, 0.3), expand = c(0,0)) +
+  theme_eric +
+  scale_fill_viridis_c() +
+  plot.variogram() +
+  labs(x = "Centroid Energy (eV)",
+       y = "Integrated Intensity") +
+  annotate("text", 
+           x = rep(c(7112.4, 7113.8), each = 2),
+           y = c(0.12, 0.1, 0.21, 0.19),
+           label = c("''^'[6]'*'Fe(II)'",
+                     "Endmember", 
+                     "''^'[6]'*'Fe(III)-bearing'",
+                     "Endmember"),
+           color = "white",
+           parse = TRUE) +
+  annotate("segment", 
+           x = c(7112.4, 7113.8, 7114.3, 7114.55),
+           y = c(0.09, 0.18, 0.07, 0.07),
+           xend = c(7112.8, 7114.15, 7114.95, 7114.95),
+           yend = c(0.037, 0.145, 0.025, 0.12),
+           color = "white")
+
+
+figure6 <- ggpubr::annotate_figure(figure6, 
+                                   right = ggpubr::text_grob("[6]Fe(III)\nEndmember\n\n\n\n\n\nIntermediate\nEndmember", 
+                                                             size = 10, 
+                                                             hjust = 0, 
+                                                             x = 0, 
+                                                             y = 0.375))
+
+figure6 <- ggpubr::annotate_figure(figure6, 
+                                   bottom = ggpubr::text_grob("Figure 6", 
+                                                              face = "bold", 
+                                                              hjust = 0, 
+                                                              x = 0, 
+                                                              size = 14))
+
+figure6
+```
+
+
+## Figure 7 Smoothed redox map
+```{r Figure7, fig.width = 6, fig.height = 7}
+
+fig7a <- meData %>% 
+  ggplot(aes(x = x, y = y, fill = 100 * smooth.redox))+
+  geom_raster() +
+  scale_fill_gradientn(colours = colorRampPalette(colors = c("#00BF00", "#FFFF00", "#CF0000"))(256), 
+                       limits = c(0, 100), name = expression(Fe(III)/Sigma*Fe~("%")), 
+                       guide = guide_colorbar(title.position = "right", title.theme = element_text(angle = 90))) + 
+  
+  annotate("raster", x = meData$x, y = meData$y, fill = "black", 
+           alpha = is.na(meData$smooth.redox) & meData$smooth.centroid > first(tielines$Centroid[tielines$Redox == 1])) +
+  annotate("raster", x = meData$x, y = meData$y, fill = "magenta", 
+           alpha = is.na(meData$smooth.redox) & meData$smooth.intensity > approx(upper_join$centroid, upper_join$intensity, meData$smooth.centroid, rule = 2)$y) +
+  annotate("raster", x = meData$x, y = meData$y, fill = "white", 
+           alpha = is.na(meData$smooth.redox) & meData$smooth.intensity < first(shifted_variogram$Intensity[shifted_variogram$Coordination == 6])) +
+  
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0)) +
+  coord_fixed(1 / sqrt(2)) + 
+  theme_eric +
+  
+  theme(axis.line=element_blank(),axis.text.x=element_blank(),
+        axis.text.y=element_blank(),axis.ticks=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank(), 
+        panel.border=element_blank()) +
+  
+  annotate("text", 
+           x = c(-3.235, -3.43, -3.5, -3.33, -3.36), 
+           y = c(3.96, 3.88, 3.97, 3.84, 4.10), 
+           label = c("Ol", "Pra/Hdx", "Srp", "Srp", "Mgt"), 
+           color = c(rep("white", 4), "black"), 
+           size = 4, fontface = 1, vjust = c(rep(0.5, 4), 1)) +
+  
+  annotate("rect", 
+           xmin = min(meData$x), 
+           xmax = min(meData$x) + 0.05, 
+           ymin = min(meData$y) - 0.01, 
+           ymax = min(meData$y) - 0.015, 
+           fill = "black") +
+  
+  annotate("text", 
+           x = min(meData$x) + 0.025, 
+           y = min(meData$y) - 0.044, 
+           label = "50 µm", 
+           vjust = -0.5) +
+  annotate("segment", x = -3.36, y = 4.075, xend = -3.34, yend = 4.055, color= "black", arrow = arrow(length = unit(0.03, "npc")))
+
+
+fig7a_key <- cowplot::get_legend(fig7a)
+
+fig7a <- fig7a + theme(legend.position = "none")
+
+fig7a_key <- data_frame(x = rep(0:100, 101), y = rep(0:100, each = 101), z = y, r = y) %>% 
+  ggplot(aes(x = x, y = y)) +
+  geom_raster(aes(fill = r)) +
+  coord_fixed(12) +
+  scale_fill_gradientn(colours = colorRampPalette(colors = c("#00FF00", "#FFFF00", "#FF0000"))(256), limits = c(0, 100)) +
+  scale_alpha_continuous(range = c(0, 1))+
+  scale_y_continuous(expand = c(0,0), name = expression(Fe(III)/Sigma*Fe~("%"))) +
+  scale_x_continuous(expand = c(0,0), name = expression(Fe~Fluorescence~(7200~eV)), breaks = c(0, 100), labels = c("0", "Max")) +
+  theme_eric +
+  
+  theme(legend.position = "none", 
+        axis.title = element_text(size = 10), 
+        axis.text = element_text(size = 8),
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        plot.margin=unit(c(2.5,1,2.5,1.2),"cm")) 
+
+maxFe <- meData %>% filter(!is.na(smooth.redox)) %>% mutate(Fe_norm2 = Fe_max / I0STRM_max / TIME) %>% summarize(max = max(Fe_norm2)) %>% as.numeric()
+
+fig7b <- meData %>% 
+  ggplot(aes(x = x, y = y)) +
+  geom_raster(fill = "black") +
+  geom_raster(aes(fill = 100 * smooth.redox, alpha = Fe_max / I0STRM_max / TIME /maxFe)) +
+  scale_fill_gradientn(colours = colorRampPalette(colors = c("#00FF00", "#FFFF00", "#FF0000"))(256), limits = c(0, 100)) +
+  scale_alpha_continuous(range = c(0, 1))+
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0)) +
+  coord_fixed(1 / sqrt(2)) + 
+  theme_eric +
+  
+  theme(axis.line=element_blank(),axis.text.x=element_blank(),
+        axis.text.y=element_blank(),axis.ticks=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank(), 
+        panel.border=element_blank(), 
+        legend.position = "none") +
+  
+  
+  annotate("raster", x = meData$x, y = meData$y, fill = "black", 
+           alpha = is.na(meData$smooth.redox) & meData$smooth.centroid > first(tielines$Centroid[tielines$Redox == 1])) +
+  annotate("raster", x = meData$x, y = meData$y, fill = "magenta", 
+           alpha = is.na(meData$smooth.redox) & meData$smooth.intensity > approx(upper_join$centroid, upper_join$intensity, meData$smooth.centroid, rule = 2)$y) +
+  annotate("raster", x = meData$x, y = meData$y, fill = "white", 
+           alpha = is.na(meData$smooth.redox) & meData$smooth.intensity < first(shifted_variogram$Intensity[shifted_variogram$Coordination == 6])) +
+  
+  annotate("text", 
+           x = c(-3.235, -3.43, -3.5, -3.33, -3.36), 
+           y = c(3.96, 3.88, 3.97, 3.84, 4.10), 
+           label = c("Ol", "Pra/Hdx", "Srp", "Srp", "Mgt"), 
+           color = c(rep("white", 4), "black"), 
+           size = 4, fontface = 1, vjust = c(rep(0.5, 4), 1)) +
+  
+  annotate("rect", 
+           xmin = min(meData$x), 
+           xmax = min(meData$x) + 0.05, 
+           ymin = min(meData$y) - 0.01, 
+           ymax = min(meData$y) - 0.015, 
+           fill = "black") +
+  
+  annotate("text", 
+           x = min(meData$x) + 0.025, 
+           y = min(meData$y) - 0.044, 
+           label = "50 µm", 
+           vjust = -0.5) +
+  annotate("segment", x = -3.36, y = 4.075, xend = -3.34, yend = 4.055, color= "black", arrow = arrow(length = unit(0.03, "npc")))
+
+fig7b_key <- data_frame(x = rep(0:100, 101), y = rep(0:100, each = 101), z = y, r = x) %>% 
+  ggplot(aes(x = x, y = y)) +
+  geom_raster(fill = "black") +
+  geom_raster(aes(fill = r, alpha = z)) +
+  coord_fixed() +
+  scale_fill_gradientn(colours = colorRampPalette(colors = c("#00FF00", "#FFFF00", "#FF0000"))(256), limits = c(0, 100)) +
+  scale_alpha_continuous(range = c(0, 1))+
+  scale_x_continuous(expand = c(0,0), name = expression(Fe(III)/Sigma*Fe~("%"))) +
+  scale_y_continuous(expand = c(0,0), name = expression(Fe~Fluorescence~(7200~eV)), breaks = c(0, 100), labels = c("0", "Max")) +
+  theme_eric +
+  
+  theme(legend.position = "none", 
+        axis.title = element_text(size = 10), 
+        axis.text = element_text(size = 8),
+        plot.margin=unit(c(0.5,0.5,0.5,0),"cm")) 
+
+figure7 <- ggpubr::ggarrange(fig7a, fig7b, 
+                             labels = "AUTO", 
+                             align = "hv", 
+                             nrow = 2, 
+                             ncol = 1, 
+                             label.x = 0.04, 
+                             label.y = 0.82, 
+                             font.label = list(size = 14, color = "white", each = 2))
+
+figure7_keys <- ggpubr::ggarrange(fig7a_key, fig7b_key, nrow = 2, ncol =1)
+
+figure7 <- ggpubr::ggarrange(figure7, figure7_keys, widths = c(1, 0.6))
+
+figure7 <- ggpubr::annotate_figure(figure7, 
+                                   bottom = ggpubr::text_grob("Figure 7", 
+                                                              face = "bold", 
+                                                              hjust = 0, 
+                                                              x = 0, 
+                                                              size = 14))
+
+figure7
+```
+
+## Raman map co-registration
+### Co-registering the maps
+```{r Raman_map_co-registration}
+serp1_score <- as.matrix(read.delim("data/raman_scores/Chrysotile.txt", header=FALSE))[-1,-1]
+pyro_score <- as.matrix(read.delim("data/raman_scores/Pyroaurite.txt", header=FALSE))[-1,-1]
+olivine_score <- as.matrix(read.delim("data/raman_scores/Olivine.txt", header=FALSE))[-1,-1]
+brucite_score<- as.matrix(read.delim("data/raman_scores/OxBrc.txt", header=FALSE))[-1,-1]
+serp2_score<- as.matrix(read.delim("data/raman_scores/lizardite.txt", header=FALSE))[-1,-1]
+TiO2_intensity <- read.csv("data/raman_scores/TiO2_map.csv",header=F)
+
+scores<-array(c(olivine_score/max(olivine_score),
+                pyro_score/max(pyro_score),
+                brucite_score/max(brucite_score),
+                serp1_score/max(serp1_score),
+                serp2_score/max(serp2_score)),
+              dim=c(325,199,5))
+
+mask<-apply(scores,c(1,2),which.max)
+
+purity<-apply(scores,c(1,2),max)
+
+points <- read_csv("data/raman_scores/OM14_07_correg_points.csv") %>% 
+  magrittr::set_colnames(c("x1", "y1", "x", "y"))
+
+# Setting up affine matrix
+X <- matrix(c(rep(0, 4 * nrow(points)), 
+              rep(c(1, 0), nrow(points)), 
+              rep(0, 4 * nrow(points)), 
+              rep(c(0, 1), nrow(points))),
+            2 * nrow(points), 
+            6)
+
+for(i in 1 : nrow(points)){
+  X[rbind(c(2 * i - 1, 1), c(2 * i, 4))] <- points$x[i]
+  X[rbind(c(2 * i - 1, 2), c(2 * i, 5))]<- points$y[i]
+}
+
+X1 <- rep(NA, 2 * nrow(points))
+X1[seq(1, 2 * nrow(points) - 1, by = 2)] <- points$x1
+X1[seq(2, 2 * nrow(points), by = 2)] <- points$y1
+
+# Solving affine transform
+A <- matrix(c(qr.solve(X, X1), 0, 0, 1), 3, 3, byrow = T)
+
+# Applying transform to coordinates of meData
+new_coords <-  A %*% rbind(meData$x, meData$y, rep(1, nrow(meData)))
+
+meData <- meData %>% mutate(tformx =  new_coords[1, ],
+                            tformy =  new_coords[2, ])
+
+# interpolating centroid, intensity, and redox onto the Raman map grid
+filt.meData <- meData %>% filter(!is.na(smooth.redox))
+
+redox_map_tform <- data_frame(x = rep(as.numeric(TiO2_intensity[-1,1]), 
+                                      length(TiO2_intensity[1,-1])),
+                              y = rep(as.numeric(TiO2_intensity[1,-1]), 
+                                      each = length(TiO2_intensity[-1,1])), 
+                              smooth.redox = as.numeric(interp(filt.meData$tformy, 
+                                                               filt.meData$tformx, 
+                                                               filt.meData$smooth.redox, 
+                                                               TiO2_intensity[-1,1], 
+                                                               TiO2_intensity[1,-1])$z),
+                              smooth.centroid = as.numeric(interp(meData$tformy, 
+                                                                  meData$tformx, 
+                                                                  meData$smooth.centroid, 
+                                                                  TiO2_intensity[-1,1], 
+                                                                  TiO2_intensity[1,-1])$z), 
+                              smooth.intensity = as.numeric(interp(meData$tformy, 
+                                                                   meData$tformx, 
+                                                                   meData$smooth.intensity, 
+                                                                   TiO2_intensity[-1,1], 
+                                                                   TiO2_intensity[1,-1])$z), 
+                              Fe.fluorescence = as.numeric(interp(meData$tformy, 
+                                                                  meData$tformx, 
+                                                                  meData$Fe_max, 
+                                                                  TiO2_intensity[-1,1], 
+                                                                  TiO2_intensity[1,-1])$z),
+                              Ti.fluorescence = as.numeric(interp(meData$tformy, 
+                                                                  meData$tformx, 
+                                                                  meData$Ti, 
+                                                                  TiO2_intensity[-1,1], 
+                                                                  TiO2_intensity[1,-1])$z)) %>% 
+  mutate(smooth.redox = if_else(smooth.intensity > approx(upper_join$centroid, 
+                                                          upper_join$intensity, 
+                                                          smooth.centroid)$y,
+                                NA_real_, 
+                                smooth.redox), 
+         mask = factor(mask, labels = c("Olivine", "Pyroaurite", "Hydroxide", "Serpentine 1", "Serpentine 2")), 
+         purity = as.numeric(purity))
+
+```
+
+
+## Figure 8
+```{r Figure8, fig.width = 10, fig.height = 5}
+
+levels(redox_map_tform$mask) <- c("Olivine", "Pyroaurite", "Hydroxide", "Serpentine", "Serpentine")
+
+density.envelopes <- function(x, y, z=c(0.1, 0.25, 0.5)){
+  Kdensity <- KernSmooth::bkde2D(cbind(as.vector(x),
+                                       as.vector(y))[!is.na(as.vector(x)), ], 
+                                 c(0.015,0.003),
+                                 gridsize=c(250L, 250L),
+                                 range.x=list(c(7110, 7115.2),
+                                              c(0, 0.4)),
+                                 truncate = F)
+  KD_quantiles <- NA
+  KD_quantiles[order(Kdensity$fhat)] <- cumsum(Kdensity$fhat[order(Kdensity$fhat)]) / sum(Kdensity$fhat)
+  KD_quantiles <- matrix(KD_quantiles, 250, 250)
+  return(contourLines(Kdensity$x1, Kdensity$x2, KD_quantiles, levels=z))
+}
+
+# Sets the level of the contour and the fraction of the total point density 
+# contained. e.g. 0.1 gives a contour that contains 90% of the data.
+density_contour_level <- 0.1  
+
+
+redox_map_tform_filt <- redox_map_tform %>%
+  filter(!is.na(smooth.redox)) %>%
+  group_by(mask) %>%
+  mutate(rank = rank(purity)) %>%
+  arrange(mask, purity) %>%
+  filter(rank %in% (max(rank)-501) : max(rank))  # Select the 500 most pure pixels in each mineral.
+
+fig8a <- data_frame(min = factor(c("Serpentine", "Hydroxide", "Olivine", "Pyroaurite"), 
+                                 levels = c("Olivine", "Pyroaurite", "Hydroxide", "Serpentine")), 
+                    data = list(density.envelopes(filter(redox_map_tform_filt, 
+                                                         mask == "Serpentine")$smooth.centroid,
+                                                  filter(redox_map_tform_filt, 
+                                                         mask == "Serpentine")$smooth.intensity,
+                                                  density_contour_level),
+                                density.envelopes(filter(redox_map_tform_filt, 
+                                                         mask == "Hydroxide")$smooth.centroid,
+                                                  filter(redox_map_tform_filt, 
+                                                         mask == "Hydroxide")$smooth.intensity,
+                                                  density_contour_level),
+                                density.envelopes(filter(redox_map_tform_filt, 
+                                                         mask == "Olivine")$smooth.centroid,
+                                                  filter(redox_map_tform_filt, 
+                                                         mask == "Olivine")$smooth.intensity,
+                                                  density_contour_level),
+                                density.envelopes(filter(redox_map_tform_filt, 
+                                                         mask == "Pyroaurite")$smooth.centroid,
+                                                  filter(redox_map_tform_filt, 
+                                                         mask == "Pyroaurite")$smooth.intensity,
+                                                  density_contour_level))) %>% 
+  unnest(data) %>% 
+  group_by(min) %>% 
+  mutate(contour = 1:n()) %>% 
+  ungroup() %>% 
+  mutate(data = purrr::map(.$data, ~data_frame(x = .$x, 
+                                               y = .$y))) %>% 
+  unnest() %>% 
+  unite(group, c(min, contour), remove = FALSE) %>% 
+  ggplot(aes(x = x, y = y, group = group, fill = min)) +
+  plot.variogram("black") +
+  geom_polygon(alpha = 0.5, color = "black", size = 0.1) + 
+  scale_fill_manual(values = c("Serpentine" = "blue", 
+                               "Hydroxide" = "red", 
+                               "Olivine" = "green", 
+                               "Pyroaurite" = "magenta")) +
+  labs(x = "Centroid Position (eV)",
+       y = "Integrated Intensity", 
+       fill = "") +
+  theme_eric +
+  coord_cartesian(xlim = c(7112.75, 7114.75), ylim = c(0, 0.3)) +
+  
+  theme(legend.justification = c(0, 1), 
+        legend.position = c(0.03, 1.05), 
+        legend.background = element_blank(), 
+        legend.text = element_text(size = 12), 
+        plot.margin = unit(c(1,1,0,0), "lines")) +
+  
+  guides(fill = guide_legend(override.aes = list(alpha=1)))
+
+fig8b <- redox_map_tform %>% 
+  filter(!is.na(smooth.redox)) %>% 
+  group_by(mask) %>%
+  mutate(rank = rank(purity)) %>% 
+  arrange(mask, purity) %>% 
+  filter(rank %in% (max(rank)-500) : max(rank)) %>%
+  ggplot() +
+  
+  stat_density(geom = "line", 
+               aes(x = 100 * smooth.redox, 
+                   color = mask), 
+               position = "identity", 
+               bw = 2, 
+               size = 1.2) +
+  
+  scale_color_manual(values = c("Olivine" = "green", 
+                                "Pyroaurite" = "magenta", 
+                                "Hydroxide" = "red", 
+                                "Serpentine" = "blue")) +
+  
+  theme_eric + 
+  
+  labs(x = expression("Fe(III)/"*Sigma*"Fe (%)"),
+       y = expression("Pixel Kernel Density"), 
+       color = "") +
+  
+  scale_y_continuous(expand = expand_scale(mult = c(0, .2))) +
+  scale_x_continuous(breaks = (0 : 5)*20, expand = c(0, 0)) +
+  coord_cartesian(xlim = c(-1, 101)) +
+  theme(legend.justification = c(0, 1), 
+        legend.position = c(0.03, 1.05), 
+        legend.background = element_blank(), 
+        legend.text = element_text(size = 12), 
+        plot.margin = unit(c(1,1,0,0), "lines"))
+
+figure8 <- ggpubr::ggarrange(fig8a, fig8b, 
+                             labels = "AUTO", 
+                             align = "hv", 
+                             label.x = 0.89, 
+                             label.y = 0.97, 
+                             font.label = list(size = 20, color = "black", each = 2))
+
+figure8 <- ggpubr::annotate_figure(figure8, 
+                                   bottom = ggpubr::text_grob("Figure 8", 
+                                                              face = "bold", 
+                                                              hjust = 0, 
+                                                              x = 0, 
+                                                              size = 14))
+
+figure8
+
+```
+
+
+# Error Analysis
+## Peak fitting comparison
+### Loading peak-fit spectra
+```{r set_up_peakfitting}
+
+peakfit <- function(file){
+  spectrum <- rdx_read_spectrum(paste0("data/peakfit_spectra/shifted_normed/", file))
+  spectrum.header <- readLines(paste0("data/peakfit_spectra/spline_residuals/", file)) %>% 
+    grep(pattern = "^#", value = TRUE) 
+  
+  background.fit <- rdx_read_spectrum(paste0("data/peakfit_spectra/spline_residuals/", file))
+  
+  fit.header <- readLines(paste0("data/peakfit_spectra/spline.peaks/", 
+                                 grep(unlist(str_split(file, ".xdi"))[1],
+                                      list.files("data/peakfit_spectra/spline.peaks/"), 
+                                      value = TRUE))) %>% 
+    grep(pattern = "^#", value = TRUE) 
+  
+  peaks <- regmatches(fit.header[grep("pseudo-voigt", fit.header) + 1], 
+                      gregexpr("(?<= = ).*?(?=\\()", 
+                               fit.header[grep("pseudo-voigt", fit.header) + 1], 
+                               perl=TRUE)) %>%
+    unlist() %>%
+    as.numeric() %>%
+    matrix(ncol = 4, byrow = TRUE)
+  
+  pvoigt <- function(x, parms){
+    parms[1] * (parms[4] / 2 / pi * parms[3] / ((x - parms[2]) ^ 2 + parms[3] ^ 2 / 4) +
+                  (1 - parms[4]) * 2 * sqrt(2 * log(2)) / parms[3] / sqrt(2 * pi) * 
+                  exp(-4 * log(2) * ((x - parms[2]) / parms[3]) ^ 2))}
+  
+  fit.data <- read_table(paste0("data/peakfit_spectra/spline.peaks/", 
+                                grep(unlist(str_split(file, ".xdi"))[1],
+                                     list.files("data/peakfit_spectra/spline.peaks/"), 
+                                     value = TRUE)), comment = "#", col_names = FALSE)
+  
+  
+  spectrum <- spectrum %>% 
+    mutate(peaks = approx(unlist(fit.data[, 1]), unlist(fit.data[, 3]), unlist(energy))$y, 
+           spline.background = approx(unlist(background.fit$energy),
+                                      unlist(background.fit$spline.background), 
+                                      unlist(energy))$y,
+           model = spline.background + peaks,
+           background_sub = `Normalized Fluorescence` - spline.background, 
+           residual = `Normalized Fluorescence` - model)
+  
+  newheader <- c(spectrum.header[1 : (length(spectrum.header) - 3)], 
+                 "# ",
+                 "#  Pre edge peaks:",
+                 fit.header[
+                   min(grep("gaussian |pseudo-voigt", fit.header)) : 
+                     (max(grep("gaussian |pseudo-voigt", fit.header)) + 2)
+                 ], 
+                 spectrum.header[(length(spectrum.header) - 2) : (length(spectrum.header) - 1)],
+                 paste("#", paste(colnames(spectrum), collapse = "\t"), sep = "\t"))
+  
+  data_frame(spectrum = list(spectrum), 
+             peakfit.centroid = sum(fit.data[ , 3] * fit.data[, 1]) / sum(fit.data[ , 3]),
+             peakfit.intensity = sum(unlist(fit.data[-1 , 3]) * diff(unlist(fit.data[ , 1]))))
+}
+
+peakfit.data <- data_frame(file = list.files("data/peakfit_spectra/spline_residuals/"), 
+                           y = purrr::map(file, peakfit)) %>% 
+  unnest()
+
+```
+
+### Calibrating peak fit variogram
+```{r peakfit_variogram_calibration}
+
+pf.standards <- tibble(sample_name = c("Andradite", 
+                                       "olivine_std", 
+                                       "Siderite", 
+                                       "staurolite", 
+                                       "Sanidine"), 
+                       Redox = c(1, 0, 0, 0, 1), 
+                       Coordination = c(6, 6, 6, 4, 4))
+
+pf.standards <- peakfit.data %>% 
+  
+  filter(grepl(paste("[Oo]liv", 
+                     "[Ss]iderite", 
+                     "[Ss]taurolite", 
+                     "[Aa]ndradite", 
+                     "[Ss]anidine", 
+                     sep = "|"), 
+               file)) %>% 
+  
+  mutate(sample_name = str_match_all(file,"shifted_(.+)_avg.+\\.xdi$")) %>% 
+  mutate(sample_name = purrr::map(.$sample_name,'['(2))) %>% 
+  unnest(sample_name) %>% 
+  inner_join(pf.standards, by = "sample_name") %>% 
+  group_by(Redox, Coordination) 
+
+pf.centroids <- pf.standards %>% 
+  
+  # Can't use andradite as a centroid standard (intermediate redox).
+  filter(sample_name != "Andradite") %>% 
+  
+  summarize(meas_centroid = mean(peakfit.centroid)) 
+
+pf.intensity <- pf.standards %>% 
+  summarize(meas_intensity = mean(peakfit.intensity)) 
+
+pf.standards <- right_join(pf.centroids, pf.intensity, by = c("Redox", "Coordination"))
+
+raw_variogram <- read_csv("data/Raw_variogram_Andreani_8Oct18.csv")
+
+variogram_stds <- raw_variogram %>% 
+  filter(Redox %in% c(0, 1)) %>% inner_join(pf.standards, by = c("Redox", "Coordination"))
+
+centroid_fit <- lm(meas_centroid ~ Centroid, data = variogram_stds)
+intensity_fit <- lm(meas_intensity ~ Intensity, data = variogram_stds)
+
+pf.variogram <- raw_variogram %>% 
+  mutate(meas_centroid = predict(centroid_fit, .), 
+         meas_intensity = predict(intensity_fit, .)) %>% 
+  select(-Centroid, -Intensity) %>% 
+  rename(Centroid = meas_centroid, Intensity = meas_intensity) %>% 
+  filter(!(Redox == 0.0 & Coordination == 4)) %>% 
+  arrange(Redox, desc(Coordination))
+
+pf.variogram2 <- raw_variogram %>% 
+  mutate(meas_centroid = predict(centroid_fit, .), 
+         meas_intensity = predict(intensity_fit, .)) %>% 
+  select(-Centroid, -Intensity) %>% 
+  rename(centroid = meas_centroid, intensity = meas_intensity) %>% 
+  arrange(Redox, desc(Coordination))
+
+pf.tielines <- numeric()
+for(i in unique(pf.variogram$Redox)){
+  line <- lm(Centroid ~ Intensity, 
+             data = pf.variogram, 
+             subset = (pf.variogram$Redox == i))$coefficients
+  int_seq <- seq(0.003, last(pf.variogram$Intensity[pf.variogram$Redox == i]), by = 0.01)
+  pf.tielines <- rbind(pf.tielines, 
+                       cbind(rep(i, length(int_seq)),
+                             int_seq*line[2]+line[1],
+                             int_seq
+                       )
+  )
+  
+}
+
+pf.upper_join <- pf.variogram2 %>% 
+  filter(Coordination == 4) %>% 
+  select(centroid, intensity)
+
+pf.tielines <- pf.tielines %>% as_tibble()
+colnames(pf.tielines) <- c("Redox", "Centroid", "Intensity")
+pf.tielines$Centroid[pf.tielines$Redox == 0] <- 
+  pf.variogram$Centroid[pf.variogram$Redox==0 & pf.variogram$Coordination == 6]
+```
+
+### Peak fit variogram set up
+```{r peak_fit_variogram_plotting}
+
+pf.variogram.plot <- list(
+  
+  geom_point(
+    aes(centroid, intensity),
+    data = pf.variogram2 %>% filter(Redox %in% c(0, 1)),
+    inherit.aes = FALSE,
+    shape = 21,
+    size = 5,
+    fill = "red",
+    color = "black"),
+  
+  geom_segment(
+    aes(x = x, y = y, xend = xend, yend = yend),
+    data = tibble(
+      x = pf.variogram2$centroid[pf.variogram2$Coordination == 6],
+      y = pf.variogram2$intensity[pf.variogram2$Coordination == 6],
+      xend = pf.variogram2$centroid[pf.variogram2$Coordination == 4],
+      yend = pf.variogram2$intensity[pf.variogram2$Coordination == 4]),
+    inherit.aes = FALSE,
+    color = "red"),
+  
+  geom_polygon(
+    aes(centroid, intensity),
+    data = (pf.variogram2 %>% filter(Redox %in% c(0, 1)))[c(1, 2, 4, 3), ],
+    inherit.aes = FALSE,
+    fill = NA,
+    color = "red",
+    size = 1)
+)
+
+
+
+```
+
+### Comparing peak fitting results
+```{r peak_fit_comparison}
+
+xanes_spectra <- xanes_spectra %>%
+  group_by(file_name, me.centroid, me.intensity) %>% 
+  nest() %>% 
+  mutate(
+    out.of.bounds = me.intensity > approx(upper_join$centroid, 
+                                          upper_join$intensity, 
+                                          me.centroid, rule = 2)$y,
+    redox = case_when(
+      out.of.bounds ~ NA_real_,
+      .$me.centroid > tielines$Centroid[tielines$Redox == 1][1] ~ NA_real_,
+      .$me.centroid < tielines$Centroid[tielines$Redox == 0][1] ~ NA_real_,
+      !out.of.bounds ~ interpp(x = tielines$Centroid, 
+                               y = tielines$Intensity, 
+                               z = tielines$Redox, 
+                               xo = .$me.centroid, 
+                               yo = .$me.intensity, 
+                               duplicate = "mean")$z),
+    sample = case_when(grepl("shifted", .$file_name) ~ str_split(.$file_name, 
+                                                                 "shifted_", 
+                                                                 simplify = TRUE)[, 2],
+                       TRUE ~ .$file_name))
+
+
+peakfit.data <- peakfit.data %>% 
+  mutate(out.of.bounds = peakfit.intensity > approx(pf.upper_join$centroid, 
+                                                    pf.upper_join$intensity, 
+                                                    peakfit.centroid, rule = 2)$y,
+         pf.redox = case_when(
+           out.of.bounds ~ NA_real_,
+           .$peakfit.centroid > pf.tielines$Centroid[pf.tielines$Redox == 1][1] ~ NA_real_,
+           .$peakfit.centroid < pf.tielines$Centroid[pf.tielines$Redox == 0][1] ~ NA_real_,
+           !out.of.bounds ~ interpp(x = pf.tielines$Centroid, 
+                                    y = pf.tielines$Intensity, 
+                                    z = pf.tielines$Redox, 
+                                    xo = .$peakfit.centroid, 
+                                    yo = .$peakfit.intensity, 
+                                    duplicate = "mean")$z),
+         sample = str_split(file, "normed_shifted_", simplify = TRUE)[ , 2]) %>% 
+  left_join(xanes_spectra, by = "sample") %>% 
+  filter(!grepl("shifted_", file_name))
+
+peakfit_rmse <- peakfit.data %>% 
+  mutate(error = pf.redox - redox) %>% 
+  summarize(rmse = rmse(error)) %>% 
+  unlist()
+peakfit.count <- peakfit.data %>% 
+  filter(!is.na(redox) & !is.na(pf.redox)) %>% 
+  nrow()
+
+bourdelle_stds <- data_frame(sample = c("Chlo1", "Chlo2", "clint"),
+                             known.redox = c(0.2, 0.14, 0.70))
+
+bourdelle_stds <- peakfit.data %>% 
+  mutate(sample = case_when(grepl("Chlo1", .$file) ~ "Chlo1",
+                            grepl("chlo2", .$file) ~ "Chlo2",
+                            grepl("clintonite", .$file) ~ "clint",
+                            TRUE ~ NA_character_)) %>% 
+  filter(!is.na(sample)) %>% 
+  select(sample, pf.redox, redox) %>% 
+  gather(key = "key", value = "value", -sample) %>% 
+  group_by(sample, key) %>% 
+  summarize(redox.mean = mean(value, na.rm = TRUE),
+            redox.sd = sd(value, na.rm = TRUE)) %>% 
+  left_join(bourdelle_stds, by = "sample")
+
+bourdelle_stds_rmse <- bourdelle_stds %>% 
+  ungroup() %>%  
+  filter(key == "redox") %>%
+  mutate(redox.error = redox.mean - known.redox) %>% 
+  summarize(rmse = rmse(redox.error)) %>% 
+  as.numeric()
+
+```
+
+## Noise Monte Carlo simulation
+### Load data
+```{r noise_load_data, cache = TRUE}
+# Read in the PEME map
+meData.noise <- rdx_read_folder(root_path("data/ME_maps"), quiet = TRUE) %>% 
+  
+  # Use the pivot function to transform the dataframe. 
+  rdx_peme_pivot() %>% 
+  
+  # Apply the energy calibration
+  rdx_calibrate_energy(shift = 7112 - map_cal(first(meData$collection_time))) %>% 
+  
+  select(-collection_time, -(Ca:I0STRM_max)) %>%
+  
+  filter(!(xi %in% c(1, 206)) & !(yi %in% c(1))) %>% 
+  
+  unnest()
+```
+
+### Monte Carlo function
+```{r Monte_Carlo_function, cache=TRUE}
+error.function <- function(data){
+  iter <- data %>% 
+    
+    # Sample the Poisson distribution about the observed data  
+    mutate(Fe = rpois(n = nrow(.), lambda = Fe)) %>% 
+    
+    # Process the simulated data
+    nest(energy : Fe, .key = FeData) %>% 
+    rdx_normalize_I0() %>% 
+    rdx_edge_normalize() %>% 
+    
+    unnest() %>% 
+    group_by(xi, yi) %>% 
+    filter(old_energy != 7200) %>%
+    
+    # Compute the centroid and intensity of the pre-edge feature at every pixel
+    mutate(centroid = rdx_centroid(normFluor, energy), 
+           intensity = rdx_intensity(normFluor, energy)) %>% 
+    
+    # Clean up again
+    ungroup() %>% 
+    nest(energy : normFluor, .key = FeData) %>% 
+    select(xi, yi, centroid, intensity) %>% 
+    
+    mutate(out.of.bounds = intensity > approx(upper_join$centroid, upper_join$intensity, centroid)$y, 
+           
+           redox = case_when(!out.of.bounds ~ 
+                               interpp(x = tielines$Centroid, 
+                                       y = tielines$Intensity, 
+                                       z = tielines$Redox, 
+                                       xo = .$centroid, 
+                                       yo = .$intensity, 
+                                       duplicate = "mean")$z,
+                             out.of.bounds ~ NA_real_)) %>% 
+    
+    mutate(smooth.centroid = as.numeric(
+      rdx_gauss_filter(
+        matrix(
+          unlist(centroid), 
+          length(unique(yi)), 
+          length(unique(xi))),
+        sigma = 1)),
+      smooth.intensity = as.numeric(
+        rdx_gauss_filter(
+          matrix(
+            unlist(intensity),
+            length(unique(yi)), 
+            length(unique(xi))),
+          sigma = 1)),
+      
+      # Points falling above the [6]Fe(II)-[4]Fe(III) are invalid
+      out.of.bounds.smooth = smooth.intensity > approx(upper_join$centroid, 
+                                                       upper_join$intensity, 
+                                                       smooth.centroid)$y, 
+      
+      smooth.redox = case_when(!out.of.bounds.smooth ~ 
+                                 interpp(x = tielines$Centroid, 
+                                         y = tielines$Intensity, 
+                                         z = tielines$Redox, 
+                                         xo = smooth.centroid, 
+                                         yo = smooth.intensity, 
+                                         duplicate = "mean")$z,
+                               out.of.bounds.smooth ~ NA_real_))
+  
+  data_frame(xi = iter$xi,
+             yi = iter$yi,
+             cent.noise = iter$centroid,
+             int.noise = iter$intensity,
+             redox.noise = iter$redox,
+             smooth.cent.noise = iter$smooth.centroid,
+             smooth.int.noise = iter$smooth.intensity,
+             smooth.redox.noise = iter$smooth.redox)
+}
+
+```
+
+### Running Monte Carlo simulation
+```{r Monte_Carlo_analysis, cache = TRUE}
+# Set the number of iterations to simulate
+iteration_n <- 200
+
+plan(multiprocess)
+
+# Simulate the redox map with random noise n times
+# This will take some time. 
+noise <- data_frame(iteration = 1:iteration_n, 
+                    result = future_map(iteration, ~error.function(meData.noise),
+                                        .progress = TRUE,
+                                        .options = future_options(seed = 1001L)))
+
+```
+
+### Clean up noise datasets
+```{r noise_datasets, cache = TRUE}
+noise.by.pixel <- noise %>% 
+  unnest(result) %>% 
+  group_by(xi, yi) %>%
+  right_join(meData, by = c("xi", "yi")) %>% 
+  
+  group_by(x, 
+           xi, 
+           y, 
+           yi, 
+           centroid, 
+           intensity, 
+           redox, 
+           smooth.centroid, 
+           smooth.intensity, 
+           smooth.redox) %>% 
+  
+  summarize(cent.rmse = rmse(cent.noise - centroid),
+            int.rmse = rmse(int.noise - intensity),
+            redox.rmse = rmse(redox.noise - redox),
+            smooth.cent.rmse = rmse(smooth.cent.noise - smooth.centroid),
+            smooth.int.rmse = rmse(smooth.int.noise - smooth.intensity),
+            smooth.redox.rmse = rmse(smooth.redox.noise - smooth.redox),
+            Fe_max = mean(Fe_max))
+
+noise.overall <- noise %>% 
+  unnest(result) %>% 
+  right_join(meData, by = c("xi", "yi")) %>% 
+  summarize(cent.rmse = rmse(cent.noise - centroid),
+            int.rmse = rmse(int.noise - intensity),
+            redox.rmse = rmse(redox.noise - redox),
+            smooth.cent.rmse = rmse(smooth.cent.noise - smooth.centroid),
+            smooth.int.rmse = rmse(smooth.int.noise - smooth.intensity),
+            smooth.redox.rmse = rmse(smooth.redox.noise - smooth.redox))
+
+```
+
+### Self-absorption check
+```{r}
+# Elemental stoichiometric formulas for minerals to consider
+formulas <- tibble(Phase = c("Olivine", "Serpentine", "Pyroaurite", "Magnetite"), 
+                   Mg = c(1.8, 2.88, 6, 0), 
+                   Fe = c(0.2, 0.12, 2, 3), #Chosing Mg#90
+                   Si = c(1, 2, 0, 0), 
+                   O = c(4, 9, 23, 4), 
+                   H = c(0, 4, 24, 0),
+                   C = c(0, 0, 1, 0),
+                   Density = c(3.32, 2.58, 2.12, 5.18)) #g/cm^3 from webmineral.com
+
+# Load X-ray mass attenuation coeficient data from NIST Standard Reference Database 126, Table 3
+# https://www.nist.gov/pml/x-ray-mass-attenuation-coefficients
+# accessed 27June19, data updated July 2004.
+NIST_table1 <- read_excel("data/xray_data.xlsx", 1, skip = 1) %>% 
+  mutate(mass = Z / `Z/A`)
+
+# Computing elemental mass fractions of minerals
+phase <- formulas %>% 
+  gather(element, coefficient, -Phase, -Density) %>% 
+  arrange(Phase, element) %>% 
+  left_join(NIST_table1 %>% select(Symbol, mass), by = c("element" = "Symbol")) %>% 
+  group_by(Phase) %>% 
+  mutate(mass_fraction = coefficient * mass / sum(coefficient * mass))
+
+# Interpolating the X-ray mass attenuation coeficient for each element at 6404 eV and 7200 eV. 
+# Taking care not to interpolate between data points that span an absorption edge.
+mu_d <- read_excel("data/xray_data.xlsx", 2, skip = 1) %>% 
+  mutate(Energy = `Energy (MeV)` * 1e6) %>%  # convert MeV to eV
+  filter(between(Energy, 1000, 10000)) %>% 
+  group_by(Element) %>% 
+  mutate(Edge = case_when(Edge == "K" ~ TRUE, 
+                          is.na(Edge) ~ FALSE, 
+                          TRUE ~ NA)) %>% 
+  left_join(
+    {.} %>% 
+      filter(Edge) %>% 
+      mutate(EdgeE = Energy) %>% 
+      select(Element, EdgeE),
+    by = "Element"
+  ) %>% 
+  mutate(Edge = ifelse(is.na(EdgeE), FALSE, Edge | Energy > EdgeE)) %>% 
+  group_by(Element, Edge) %>% 
+  summarize(mu_d_Ei = approx(Energy, `µ/density (cm^2/g)`, 7200)$y,
+            mu_d_Fi = approx(Energy, `µ/density (cm^2/g)`, 6404)$y) %>% 
+  group_by(Element) %>% 
+  summarize(mu_d_Ei = mean(mu_d_Ei, na.rm = TRUE),
+            mu_d_Fi = mean(mu_d_Fi, na.rm = TRUE))
+
+# Computing the total absorption coefficients for Fe and for other elements, in each mineral.
+mu <- phase %>% 
+  left_join(mu_d, by = c("element" = "Element")) %>% 
+  group_by(Phase) %>% 
+  mutate(muEi = mass_fraction * Density * mu_d_Ei,
+         muFi = mass_fraction * Density * mu_d_Fi) %>% 
+  summarize(muF = sum(muFi) * 1e-4, # µ(F), µm^-1
+            muE_Fe = sum(muEi * as.numeric(element == "Fe")) * 1e-4, # µ(E) due to Fe, µm^-1
+            muE_o = sum(muEi * as.numeric(element != "Fe")) * 1e-4) %>%  # µ(E) due to other elements, µm^-1
+  bind_cols(data_frame(thickness = c(3, rep(30, 3)))) %>%  # nominally 30 µm thick section, magnetite grains are ~3 µm in diameter.
+  nest() 
+
+# Overabsorption model (slightly modified but equivalent to Booth and Bridges, 2005 equation 1)
+# C is a coefficient on the absorption coefficient of Fe, which represents the true normalized
+# absorption away from 7200 eV.
+OAfun <- function(C, muE_Fe, muE_o, muF, t){
+  C * muE_Fe/((C * muE_Fe) + muE_o + muF) * (1 - exp(-((C * muE_Fe) + muE_o + muF) * t / sin(pi/4)))
+}
+
+# Inverting/solving the overabsorption model for C.
+# The ratio of OAfun(C)/OAfun(1)  represents the normalized fluorescence
+# (affected by over absorption) that would be observed for a given C. 
+# if x is an observed mu, then inv_OA(x) is the true mu that would have produced 
+# that observation due to overabsorption (given values of muE_Fe, muE_o, muF, and t).
+inv_OA <- Vectorize(function(x, muE_Fe, muE_o, muF, t, lower = -0.05, upper = 1.05, tol = 1e-3){
+  uniroot(function(y){
+    OAfun(C = y, muE_Fe = muE_Fe, muE_o = muE_o, muF = muF, t = t)/OAfun(C = 1, muE_Fe = muE_Fe, muE_o = muE_o, muF = muF, t = t) - x
+  }, lower = lower, upper = upper, tol=tol)[1] %>% unlist()
+})
+
+# Setting up the data matrix in order to find C at every pixel, and for each mineral. 
+oaData <- meData %>%  unnest(FeData) %>% mutate(mu = list(mu$data[[1]])) %>% unnest(mu) %>% nest(energy:thickness, .key = SA_data)
+
+future::plan(multiprocess)
+oaData <- oaData %>% 
+  mutate(SA_data = furrr::future_map(.$SA_data, 
+                                     ~mutate(., Fe_I0 = inv_OA(normFluor, muE_Fe, muE_o, muF, t = thickness)), 
+                                     .progress = TRUE)) %>% 
+  rename(FeData = SA_data)
+
+# Process the modeled data as usual
+oaData <- oaData %>% 
+  
+  rdx_edge_normalize() %>% 
+  
+  # Clean up...
+  unnest() %>% 
+  group_by(xi, yi, Phase) %>% 
+  
+  # Compute the centroid and intensity of the pre-edge feature at every pixel
+  mutate(centroid = rdx_centroid(normFluor[-10], energy[-10])) %>% 
+  mutate(intensity = rdx_intensity(normFluor[-10], energy[-10])) %>% 
+  
+  # Clean up again
+  select(-(muF:muE_o)) %>% 
+  ungroup() %>% 
+  nest(energy : normFluor, .key = FeData)
+
+#Calculate redox of modeled data
+oaData <- oaData %>% 
+  filter(!is.na(centroid)) %>% 
+  
+  # Points falling above the [6]Fe(II)-[4]Fe(III) are invalid
+  mutate(out.of.bounds = intensity > approx(upper_join$centroid, upper_join$intensity, centroid)$y, 
+         
+         redox = case_when(!out.of.bounds ~ 
+                             interpp(x = tielines$Centroid, 
+                                     y = tielines$Intensity, 
+                                     z = tielines$Redox, 
+                                     xo = .$centroid, 
+                                     yo = .$intensity, 
+                                     duplicate = "mean")$z,
+                           out.of.bounds ~ NA_real_)) 
+
+# Calculate smoothed redox map on modeled data
+oaData <- oaData %>% group_by(Phase) %>% 
+  mutate(smooth.centroid = as.numeric(
+    rdx_gauss_filter(
+      matrix(
+        unlist(centroid), 
+        length(unique(yi)), 
+        length(unique(xi))), 
+      sigma = 1)),
+    smooth.intensity = as.numeric(
+      rdx_gauss_filter(
+        matrix(
+          unlist(intensity),
+          length(unique(yi)), 
+          length(unique(xi))),
+        sigma = 1)),
+    
+    # Points falling above the [6]Fe(II)-[4]Fe(III) are invalid
+    out.of.bounds.smooth = smooth.intensity > approx(upper_join$centroid, 
+                                                     upper_join$intensity, 
+                                                     smooth.centroid)$y, 
+    
+    smooth.redox = case_when(!out.of.bounds.smooth ~ 
+                               interpp(x = tielines$Centroid, 
+                                       y = tielines$Intensity, 
+                                       z = tielines$Redox, 
+                                       xo = smooth.centroid, 
+                                       yo = smooth.intensity, 
+                                       duplicate = "mean")$z,
+                             out.of.bounds.smooth ~ NA_real_))
+
+
+# Aggregated errors in centroid, intensity, and redox by OA model mineral
+overabsorption.results <- oaData %>% 
+  select(xi:y, Phase, smooth.centroid, smooth.intensity, smooth.redox) %>% 
+  left_join(x = meData, by = c("xi", "x", "yi", "y")) %>% 
+  mutate(redox.diff = smooth.redox.x - smooth.redox.y,
+         int.diff = smooth.intensity.x - smooth.intensity.y,
+         cent.diff = smooth.centroid.x - smooth.centroid.y) %>% 
+  group_by(Phase) %>% 
+  summarize(mean.redox = mean(redox.diff, na.rm = TRUE), 
+            sd.redox = sd(redox.diff, na.rm = TRUE), 
+            rmse.redox = rmse(redox.diff), 
+            mean.cent = mean(cent.diff, na.rm = TRUE), 
+            sd.cent = sd(cent.diff, na.rm = TRUE), 
+            rmse.cent = rmse(cent.diff), 
+            mean.int = mean(int.diff, na.rm = TRUE), 
+            sd.int = sd(int.diff, na.rm = TRUE), 
+            rmse.int = rmse(int.diff))
+
+# Since errors for all minerals are small, pooled the errors across all minerals:
+overabsorption.results <- oaData %>% 
+  select(xi:y, Phase, smooth.centroid, smooth.intensity, smooth.redox) %>% 
+  left_join(x = meData, by = c("xi", "x", "yi", "y")) %>% 
+  mutate(redox.diff = smooth.redox.x - smooth.redox.y,
+         int.diff = smooth.intensity.x - smooth.intensity.y,
+         cent.diff = smooth.centroid.x - smooth.centroid.y) %>% 
+  summarize(mean.redox = mean(redox.diff, na.rm = TRUE), 
+            sd.redox = sd(redox.diff, na.rm = TRUE), 
+            rmse.redox = rmse(redox.diff), 
+            mean.cent = mean(cent.diff, na.rm = TRUE), 
+            sd.cent = sd(cent.diff, na.rm = TRUE), 
+            rmse.cent = rmse(cent.diff), 
+            mean.int = mean(int.diff, na.rm = TRUE), 
+            sd.int = sd(int.diff, na.rm = TRUE), 
+            rmse.int = rmse(int.diff)) %>% 
+  bind_cols(Phase = "All") %>% 
+  select(Phase, mean.redox:rmse.int)
+
+overabsorption.results
+```
+
+
+## Figure 9 Peak fitting comparison
+
+```{r Figure_9, fig.width = 10, fig.height = 6}
+
+Fig9a <- peakfit.data %>%  
+  ggplot(aes(x = pf.redox * 100, y = redox * 100, label = sample)) + 
+  geom_abline(slope = 1, 
+              intercept = c(0, -peakfit_rmse * 100, peakfit_rmse * 100), 
+              linetype = c(1, 2, 2)) + 
+  geom_point(size = 3, shape = 21, fill = "blue") +
+  coord_fixed(xlim = c(0, 100), ylim = c(0, 100)) +
+  labs(x = expression("Fe(III)/"*Sigma*"Fe from peak fitting (%)"),
+       y = expression("Fe(III)/"*Sigma*"Fe from map (%)")) +
+  theme_eric
+
+Fig9b <- bourdelle_stds %>% 
+  filter(key == "redox") %>% 
+  filter(!is.na(redox.mean)) %>% 
+  ggplot(aes(x = known.redox * 100, y = redox.mean * 100)) + 
+  geom_abline(slope = 1, intercept = c(0), linetype = c(1))+
+  geom_errorbar(aes(ymin = redox.mean * 100 - redox.sd * 100, 
+                    ymax = redox.mean * 100 + redox.sd * 100), 
+                color = "black",
+                width = 3) +
+  geom_errorbarh(aes(xmin = known.redox * 100 - 3, 
+                     xmax = known.redox * 100 + 3), 
+                 color = "black", 
+                 height = 3) +
+  geom_point(size = 3, shape = 21, fill = "red") +
+  scale_fill_manual(values = c("red", "blue")) +
+  theme_eric +
+  coord_fixed(xlim = c(0,100), ylim = c(0,100)) +
+  labs(x = expression("Actual Fe(III)/"*Sigma*"Fe (%)"),
+       y = expression("Measured Fe(III)/"*Sigma*"Fe (%)"))
+
+Figure9 <- ggpubr::ggarrange(Fig9a, Fig9b, 
+                             labels = "AUTO", 
+                             align = "hv", 
+                             label.x = 0.22, 
+                             label.y = 0.88, 
+                             font.label = list(size = 20, color = "black", each = 2))
+
+ggpubr::annotate_figure(Figure9, 
+                        bottom = ggpubr::text_grob("Figure 9", 
+                                                   face = "bold", 
+                                                   hjust = 0, 
+                                                   x = 0, 
+                                                   size = 14))
+```
+
+# Supplemental Figures
+## SI Figure 1 Unsmoothed Centroid/Intensity maps
+
+```{r Supplemental_Figure_1, fig.width = 6, fig.height = 7}
+
+# Map of Centroid position (eV): higher values -> more oxidized Fe. 
+SI2_fig1a <- g + aes(fill = centroid) + 
+  labs(fill = "\nCentroid\nPosition (eV)") +
+  scale_fill_viridis_c(option = "plasma", limits = c(7112.25, 7114.75)) +
+  theme(plot.margin = margin(0, 100, 0, 0)) + 
+  annotate("text", 
+           x = c(-3.235, -3.43, -3.5, -3.33, -3.33), 
+           y = c(3.96, 3.88, 3.97, 3.84, 4.05), 
+           label = c("Ol", "Pra/Hdx", "Srp", "Srp", "Mgt"), 
+           color = c("white", rep("black", 4)), 
+           size = 4, fontface = 1)
+
+# Map of integrated intensity (nfu/normalized fluorescence units): 
+# higher values -> more tetrahedral coordination of Fe. 
+SI2_fig1b <- g + aes(fill = intensity) + 
+  labs(fill = "\nIntegrated\nIntensity") +
+  scale_fill_viridis_c(option = "plasma", limits = c(0.02, 0.16)) +
+  theme(plot.margin = margin(0, 100, 0, 0)) + 
+  annotate("text", 
+           x = c(-3.235, -3.43, -3.5, -3.33, -3.33), 
+           y = c(3.96, 3.88, 3.97, 3.84, 4.05), 
+           label = c("Ol", "Pra/Hdx", "Srp", "Srp", "Mgt"), 
+           color = c(rep("white", 4), "black"), 
+           size = 4, fontface = 1)
+
+
+
+SI_figure1 <- ggpubr::ggarrange(SI2_fig1a, SI2_fig1b,
+                                nrow = 2, 
+                                ncol = 1, 
+                                align = "hv",
+                                labels = "AUTO",
+                                label.x = 0.02, 
+                                label.y = .93,
+                                font.label = list(size = 18, color = "black", each = 2))
+
+SI_figure1
+```
+
+
+## SI Figure 2 Unsmoothed pixel density variogram
+
+```{r}
+
+SI_figure2 <- meData %>% 
+  ggplot(aes(x = .$centroid, y = .$intensity)) +
+  stat_density_2d(aes(fill = ..density..^(1/4)), 
+                  geom = "raster", 
+                  contour = FALSE, 
+                  hjust = 0, 
+                  vjust = 0, 
+                  n = 250, 
+                  show.legend = F) +
+  density.contours +
+  scale_x_continuous(limits = c(7112.2, 7114.95), 
+                     expand = c(0,0), 
+                     breaks = seq(7112.5, 7114.5, by = 0.5)) +
+  scale_y_continuous(limits = c(0, 0.3), expand = c(0,0)) +
+  theme_eric +
+  scale_fill_viridis_c() +
+  plot.variogram() +
+  labs(x = "Centroid Energy (eV)",
+       y = "Integrated Intensity") 
+
+SI_figure2
+```
+
+## SI Figure 3 
+Titanium Fluorescence map with transparency to be overlain on Raman mineralogy map
+
+```{r Supplemental_Figure_3}
+
+raman.map <- bmp::read.bmp("data/OM14_07_overlay.bmp")
+a <- which(raman.map[450,,2] == 255)
+b <- which(raman.map[,750,2] == 255)
+raman.map2 <- raman.map[-c(b, 3), -c(1, a), ]
+raman.map2 <- raman.map2[, -dim(raman.map2)[2], -1]
+
+x1 <- as.matrix(read.delim("data/raman_scores/lizardite.txt", header=FALSE))[1,-1]
+y1 <- as.matrix(read.delim("data/raman_scores/lizardite.txt", header=FALSE))[-1,1]
+
+raman.map <- bind_cols(
+  x = rep(1:dim(raman.map2)[1], dim(raman.map2)[2]),
+  y = rep(1:dim(raman.map2)[2], each = dim(raman.map2)[1]),
+  matrix(as.vector(raman.map2), ncol = 3) %>% as_tibble()
+) %>% 
+  mutate(rgb = rgb(V1/255, V2/255, V3/255),
+         x = (x - 1) / max(x - 1) * (max(y1) - min(y1)) + min(y1),
+         y = (y - 1) / max(y - 1) * (max(x1) - min(x1)) + min(x1))
+
+Ti_map <- tibble(x = rep(TiO2_intensity[-1,1], length(TiO2_intensity[1,-1])),
+                 y = rep(as.numeric(TiO2_intensity[1,-1]), each = length(TiO2_intensity[-1,1])),
+                 TiO2_intensity = as.numeric(unlist(TiO2_intensity[-1,-1]))) %>% 
+  left_join(redox_map_tform, by = c("x", "y")) %>%
+  
+  mutate(Ti.fluorescence = ifelse(is.na(Ti.fluorescence), 0, Ti.fluorescence - min(Ti.fluorescence, na.rm = TRUE)))
+
+
+mineral_key <- (data_frame(x=1:7, y = 1:7, 
+                           Mineral = c("Chrysotile", "Epoxy", "Hydroxide Phase", "Lizardite", 
+                                       "Olivine", "Pyroaurite", "Titania"), 
+                           `Titanium Fluorescence` = seq(0, max(Ti_map$Ti.fluorescence), 
+                                                         length.out = 7)) %>% 
+                  ggplot(aes(x,y)) + 
+                  scale_fill_manual(values = c(Chrysotile = "blue", 
+                                               Epoxy = "black", 
+                                               `Hydroxide Phase` ="red", 
+                                               Lizardite = "cyan", 
+                                               Olivine = "green", 
+                                               Pyroaurite = "magenta", 
+                                               Titania = "orange")) + 
+                  geom_tile(aes(fill = Mineral), color = "black") + 
+                  geom_tile(aes(alpha = `Titanium Fluorescence`), fill = "yellow", color = "black") +
+                  scale_alpha_continuous(range = c(0, 1)) +
+                  theme_void()) %>% 
+  cowplot::get_legend()
+
+SI_figure3 <- ggplot() + 
+  
+  geom_raster(aes(x = x, y = y, fill = rgb), data = raman.map) + scale_fill_identity() +
+  
+  geom_raster(data = Ti_map, aes(x = x, y = y, alpha = Ti.fluorescence), fill = "yellow", limits = c(0, NA)) +
+  geom_polygon(data = meData %>% filter(xi %in% range(xi), yi %in% range(yi)) %>% arrange(c(1,2,4,3)),
+               aes(x = tformy, y = tformx), fill = NA, color = "red") + 
+  scale_alpha_continuous(range = c(0, 1)) +
+  scale_x_reverse(expand = c(0,0)) +
+  scale_y_reverse(expand = c(0,0)) +
+  coord_fixed(1) +
+  theme_eric +
+  guides(alpha = FALSE) +
+  
+  theme(axis.line=element_blank(),axis.text.x=element_blank(),
+        axis.text.y=element_blank(),axis.ticks=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank())
+
+SI_figure3
+
+```
+
+
+## SI Figure 4
+```{r SI Figure 4}
+a=0.787-.808
+b=0.073
+c=pi*2/180
+d = pi/2
+
+SIFig4a <- tibble(x = seq(0, 90, length.out = 50), 
+                  y = 100 * (a+b*sin(c*seq(0, 90, length.out = 50)+d))) %>% 
+  ggplot(aes(x, y)) + 
+  geom_line() +
+  geom_point(size = 0.7) + 
+  scale_x_continuous(breaks = seq(0, 90, by = 15), name = "Orientation (°)")+
+  lims(y = c(-11, 7)) + 
+  labs(y = "Orientation Error (% Fe(III)/∑Fe)") +
+  theme_eric + 
+  theme(axis.title = element_text(size = 14))
+
+SIFig4b <- tibble(orientation_error = 100 * (a + b * sin(c*seq(0, 90, length.out = 10000) + d))) %>% 
+  ggplot(aes(x = orientation_error)) + 
+  geom_histogram(aes(y = 100 * ..density..), fill = "steelblue", color = "black", breaks = c(-11, seq(100* (a - b), 100 * (a + b), length.out = 30), 7)) + 
+  lims(x = c(-11, 7)) +
+  labs(y = "Probability Density") +
+  coord_flip() +
+  theme_eric +
+  theme(axis.title.y=element_blank(), axis.text.y=element_blank()) + 
+  theme(axis.title = element_text(size = 14))
+
+SI_figure4 <- ggpubr::ggarrange(SIFig4a, SIFig4b, widths = c(0.925, 1), labels = "AUTO", label.x = c(0.88, 0.9), label.y = 0.98)
+
+SI_figure4
+```
+
+
+
+# Export Results
+```{r Export_figs_data_for_supplements}
+save(SI_figure1, SI_figure2, SI_figure3, SI_figure4, file = "Supplemental_Figures.rda")
+```
+
+```{r}
+write_lines(capture.output(sessionInfo()), "sessionInfo.txt")
+```
+

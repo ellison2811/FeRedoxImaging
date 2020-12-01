@@ -1,0 +1,29 @@
+R version 3.6.0 (2019-04-26)
+Platform: x86_64-apple-darwin15.6.0 (64-bit)
+Running under: macOS Mojave 10.14.6
+
+Matrix products: default
+BLAS:   /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib
+LAPACK: /Library/Frameworks/R.framework/Versions/3.6/Resources/lib/libRlapack.dylib
+
+locale:
+[1] en_US.UTF-8/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
+
+attached base packages:
+[1] stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] rprojroot_1.3-2 readxl_1.3.1    forcats_0.5.0   stringr_1.4.0   dplyr_0.8.5     purrr_0.3.4     readr_1.3.1     tidyr_1.0.2     tibble_3.0.1   
+[10] ggplot2_3.3.0   tidyverse_1.3.0 furrr_0.1.0     future_1.17.0   akima_0.6-2    
+
+loaded via a namespace (and not attached):
+ [1] mclust_5.4.6       Rcpp_1.0.4         mvtnorm_1.1-0      lubridate_1.7.8    lattice_0.20-38    listenv_0.8.0      assertthat_0.2.1  
+ [8] digest_0.6.25      packrat_0.5.0      R6_2.4.1           cellranger_1.1.0   backports_1.1.6    reprex_0.3.0       httr_1.4.1        
+[15] pillar_1.4.3       rlang_0.4.5        rstudioapi_0.11    raster_3.1-5       bmp_0.3            Matrix_1.2-17      labeling_0.3      
+[22] munsell_0.5.0      broom_0.5.6        compiler_3.6.0     modelr_0.1.6       xfun_0.13          pkgconfig_2.0.3    globals_0.12.5    
+[29] tidyselect_1.0.0   gridExtra_2.3      codetools_0.2-16   viridisLite_0.3.0  fansi_0.4.1        crayon_1.3.4       dbplyr_1.4.3      
+[36] withr_2.2.0        ggpubr_0.2.5       MASS_7.3-51.4      grid_3.6.0         nlme_3.1-141       jsonlite_1.6.1     gtable_0.3.0      
+[43] lifecycle_0.2.0    DBI_1.1.0          magrittr_1.5       scales_1.1.0       KernSmooth_2.23-15 cli_2.0.2          stringi_1.4.6     
+[50] farver_2.0.3       ggsignif_0.6.0     fs_1.4.1           sp_1.4-1           xml2_1.3.2         ellipsis_0.3.0     generics_0.0.2    
+[57] vctrs_0.2.4        cowplot_1.0.0      Rhdf5lib_1.6.3     tools_3.6.0        glue_1.4.0         ks_1.11.7          hms_0.5.3         
+[64] parallel_3.6.0     colorspace_1.4-1   rhdf5_2.28.1       rvest_0.3.5        knitr_1.28         haven_2.2.0       

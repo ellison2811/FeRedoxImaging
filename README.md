@@ -1,3 +1,7 @@
+<!-- badges: start -->
+[![Launch Rstudio Binder](http://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/ellison2811/FeRedoxImaging/master?urlpath=rstudio)
+<!-- badges: end -->
+
 # Data processing for quantitative Fe redox imaging
 
 This repository provides the processing code used in *Ellison, E.T., Mayhew, L.E., Miller, H.M., and Templeton, A.S. (2020) [Quantitative microscale Fe redox imaging by multiple energy X-ray fluorescence mapping at the Fe K pre-edge peak](https://doi.org/10.2138/am-2020-7359). _American Mineralogist_, 105, 1812–1829*.
